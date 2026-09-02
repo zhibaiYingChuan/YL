@@ -13,6 +13,8 @@ use daoti_common::DaotiError;
 
 use super::Injector;
 use crate::injector::InjectionResult;
+#[cfg(target_os = "linux")]
+use crate::interceptor::InjectResult;
 use crate::interceptor::TargetSyscall;
 
 /// Linux 注入器实现
