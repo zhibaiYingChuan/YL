@@ -38,7 +38,7 @@ impl LinuxInjector {
     /// # 非 Linux 平台
     /// 始终返回 `Unavailable` 错误。
     #[cfg(target_os = "linux")]
-    pub fn attach(pid: i32) -> Result<Self, DaotiError> {
+    pub fn attach(_pid: i32) -> Result<Self, DaotiError> {
         // 真实实现：
         // 1. ptrace(PTRACE_ATTACH, pid, 0, 0)
         // 2. waitpid(pid, &status, 0)

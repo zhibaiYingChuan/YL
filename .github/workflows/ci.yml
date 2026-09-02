@@ -55,13 +55,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          zig cc -target x86_64-linux -c -fPIC -nostdlib `
-            -o target/et_dyn_console_fixture.o `
-            tests/fixtures/et_dyn_console.S
-          zig cc -target x86_64-linux -nostdlib -pie `
-            -Wl,--build-id=none -Wl,-e,_start `
-            -o target/et_dyn_console_fixture `
-            target/et_dyn_console_fixture.o
+          zig cc -target x86_64-linux -c -fPIC -nostdlib -o target/et_dyn_console_fixture.o tests/fixtures/et_dyn_console.S
+          zig cc -target x86_64-linux -nostdlib -pie -Wl,--build-id=none -Wl,-e,_start -o target/et_dyn_console_fixture target/et_dyn_console_fixture.o
           Remove-Item -LiteralPath target/et_dyn_console_fixture.o -Force
           if (-not (Test-Path -LiteralPath "${{ github.workspace }}\target\et_dyn_console_fixture")) { throw 'Zig 未产出 ET_DYN fixture' }
       - name: 生成真实 TLS 动态 ELF fixture（Linux 工具链）
@@ -99,6 +94,7 @@ jobs:
         shell: pwsh
         run: cargo test -p daoti-core macho_runtime::tests::executes_real_macho_console_fixture --lib
       - name: 验收极简动态 ELF 第一竖切
+        if: runner.os == 'Linux'
         run: cargo test -p daoti-core load_and_run_minimal_dynamic_hello_uses_native_interpreter --lib
 
       - name: 测试
