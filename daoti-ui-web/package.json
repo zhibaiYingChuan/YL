@@ -1,0 +1,21 @@
+{
+  "name": "daoti-ui-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "驭灵玄镜前端：三环八卦图、推演时间轴、快照回魂。经 daemon HTTP/SSE 只读消费，零系统命令（Bun 红线）。",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "bun": "^1.3.14",
+    "vite": "^5.4.11"
+  }
+}

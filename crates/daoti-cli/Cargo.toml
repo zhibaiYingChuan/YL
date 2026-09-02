@@ -1,0 +1,23 @@
+[package]
+name = "daoti-cli"
+version = "0.1.0"
+edition = "2021"
+description = "驭灵令牌 CLI：status / heal / explain / run / init / snapshot。跨平台无感执行。"
+
+[[bin]]
+name = "daoti"
+path = "src/main.rs"
+
+[dependencies]
+daoti-common = { workspace = true }
+daoti-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ndarray = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,35 @@
+# 构建产物与缓存
+target/
+registry/
+.global-cache
+.package-cache
+.package-cache-mutate
+
+# 运行时解包与大型二进制
+fixtures/runtime/extract/
+fixtures/runtime/packages/
+fixtures/runtime/imported/
+fixtures/runtime/*.so
+fixtures/runtime/ld-linux-*
+fixtures/runtime/hello_dynamic
+fixtures/runtime/hello_static.elf
+fixtures/runtime/hello_minimal_dynamic.elf
+
+# 本地模型与敏感配置
+*.pt
+daoti/api_key.txt
+
+# 调试输出与临时证据
+*.log
+*.ndjson
+*.txt
+check_err.txt
+
+# 前端依赖与构建产物
+node_modules/
+daoti-ui-web/dist/
+crates/daoti-ui/binaries/
+
+# Python 缓存
+__pycache__/
+*.pyc

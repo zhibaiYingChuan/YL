@@ -1,0 +1,5 @@
+# 驭灵：固定 Rust 工具链，保证团队/CI 构建一致性
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

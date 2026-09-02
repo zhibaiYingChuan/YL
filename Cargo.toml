@@ -1,0 +1,68 @@
+# 驭灵（道体）Cargo Workspace 根
+# 依据：g:\Yl\docs\开发计划-TechnicalPlan.md 第 1.2 / 5 节
+# crate 边界：daoti-common < daoti-core < { daoti-cli, daoti-daemon, daoti-ui }
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/daoti-common",
+    "crates/daoti-core",
+    "crates/daoti-cli",
+    "crates/daoti-daemon",
+    "crates/daoti-macos-node",
+    "crates/daoti-ui",
+]
+
+# 依赖统一治理：所有 crate 在此声明版本，子 crate 仅引用，避免版本漂移
+[workspace.dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# CLI 解析
+clap = { version = "4", features = ["derive"] }
+
+# 错误处理（rust语言开发.md 施工蓝图：统一 anyhow + thiserror，全局禁 unwrap/expect）
+anyhow = "1"
+thiserror = "2"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+# 本地写端点鉴权 token 生成（S2 安全加固：daemon 生成 v4 UUID 作为写 token）
+uuid = { version = "1", features = ["v4"] }
+
+# 结构化日志与观测
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# 数值计算（模式B B2 双梯形网络纯数学变换；不启用 blas，避免 OpenBLAS/LAPACK 重依赖）
+ndarray = "0.15"
+
+# 系统信息采集（感知层，按需）
+sysinfo = "0.30"
+
+# HTTP/SSE 事件出口（玄镜/CLI 消费 daemon 事件，R8 单一数据源）
+axum = "0.7"
+futures-util = "0.3"
+# CORS：玄镜（Tauri 宿主 / 本地 dev server）跨域只读 daemon（仅回环绑定）
+tower-http = { version = "0.6", features = ["cors"] }
+
+# HTTP 客户端（P0-6 Webhook 通知 + 外部健康探针）
+ureq = { version = "2", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# 文件选择对话框（玄镜「道体·通」面板选择二进制，取绝对路径，消除相对路径在 daemon cwd 下解析失败的歧义）
+rfd = "0.15"
+
+# 版本
+daoti-common = { path = "crates/daoti-common", version = "0.1.0" }
+daoti-core = { path = "crates/daoti-core", version = "0.1.0" }
+
+[profile.release]
+# 道体玄盾：守护进程常驻，优先体积与启动速度
+opt-level = 2
+lto = "thin"
+codegen-units = 1

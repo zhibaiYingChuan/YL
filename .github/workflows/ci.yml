@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Rust 后端：构建（零警告）、测试、Clippy 静态检查
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust 缓存
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建（零警告）
+        run: cargo build --workspace
+
+      - name: 生成极简动态 ELF fixture
+        shell: bash
+        run: |
+          zig cc -target x86_64-linux -nostdlib -fPIE -pie \
+            -o fixtures/runtime/hello_minimal_dynamic.elf \
+            fixtures/runtime/minimal.s
+          test -f fixtures/runtime/hello_minimal_dynamic.elf
+
+      - name: 生成真实 ET_DYN fixture（Linux 工具链）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/build-et-dyn-fixture.sh
+      - name: 生成真实 ET_DYN fixture（Windows，WSL 工具链）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wslRoot = (wsl wslpath '${{ github.workspace }}').Trim()
+          if (-not $wslRoot) { throw 'WSL 未安装或未配置发行版；ET_DYN 真实构建无法验收' }
+          wsl bash -lc "cd '$wslRoot' && bash scripts/build-et-dyn-fixture.sh 'target/et_dyn_console_fixture'"
+          if (-not (Test-Path "${{ github.workspace }}\target\et_dyn_console_fixture")) { throw 'WSL 未产出 ET_DYN fixture' }
+      - name: 生成真实 TLS 动态 ELF fixture（Linux 工具链）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/build-tls-dynamic-fixture.sh target/tls_dynamic
+      - name: 生成真实 TLS 动态 ELF fixture（Windows，WSL 工具链）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wslRoot = (wsl wslpath '${{ github.workspace }}').Trim()
+          if (-not $wslRoot) { throw 'WSL 未安装或未配置发行版；TLS 真实构建无法验收' }
+          wsl bash -lc "cd '$wslRoot' && bash scripts/build-tls-dynamic-fixture.sh 'target/tls_dynamic'"
+          if (-not (Test-Path "${{ github.workspace }}\target\tls_dynamic")) { throw 'WSL 未产出 TLS fixture' }
+      - name: Linux 验收真实 TLS 动态取址链
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          DAOTI_TRACE_TLS: '1'
+        run: |
+          cargo test -p daoti-core --lib load_and_run_real_tls_dynamic_chain -- --ignored --nocapture
+      - name: Windows 验收真实 TLS 动态取址链
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DAOTI_TRACE_TLS: '1'
+        run: cargo test -p daoti-core --lib load_and_run_real_tls_dynamic_chain -- --ignored --nocapture
+
+      - name: Windows CLI 验收真实动态 ELF fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DAOTI_DYNAMIC_RUNTIME_ROOT: ${{ github.workspace }}
+          DAOTI_DYNAMIC_RUNTIME_FIXTURE: ${{ github.workspace }}\target\et_dyn_console_fixture
+          DAOTI_DYNAMIC_RUNTIME_EVIDENCE: passed
+        run: cargo test -p daoti-cli --test cli_smoke --no-default-features
+      - name: Linux CLI 验收真实 ET_DYN fixture
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          DAOTI_REQUIRE_ET_DYN_FIXTURE: '1'
+        run: |
+          cargo test -p daoti-cli --test cli_smoke --no-default-features
+          cargo run -p daoti-cli -- dynamic-metadata target/et_dyn_console_fixture
+      - name: 生成 Mach-O runtime fixture
+        shell: pwsh
+        run: python scripts/build-macho-console-fixture.py target/macho_console_fixture
+      - name: 验收 Mach-O runtime 真实解释执行
+        shell: pwsh
+        run: cargo test -p daoti-core macho_runtime::tests::executes_real_macho_console_fixture --lib
+      - name: 验收极简动态 ELF 第一竖切
+        run: cargo test -p daoti-core load_and_run_minimal_dynamic_hello_uses_native_interpreter --lib
+
+      - name: 测试
+        run: cargo test --workspace
+      - name: 验收自包含 PE 解析、导入绑定与控制台执行
+        run: cargo test -p daoti-core parser::pe::tests --lib
+      - name: 验收 macOS 远程节点协议
+        run: cargo test -p daoti-macos-node --lib
+      - name: macOS 真实节点 HTTP 闭环验收
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          export DAOTI_MACOS_NODE_TOKEN='ci-real-node-token'
+          export DAOTI_MACOS_NODE_ADDR='127.0.0.1:18767'
+          cargo run -p daoti-macos-node --bin daoti-macos-node > target/macos-node-process.stdout 2> target/macos-node-process.stderr &
+          node_pid=$!
+          cleanup() {
+            kill "$node_pid" 2>/dev/null || true
+            wait "$node_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --max-time 1 -H "X-Daoti-Token: $DAOTI_MACOS_NODE_TOKEN" http://127.0.0.1:18767/health > target/macos-node-health.json; then
+              break
+            fi
+            sleep 1
+          done
+          test -s target/macos-node-health.json
+          python3 - <<'PY'
+          import base64, json
+          from pathlib import Path
+          binary = Path('target/macho_console_fixture').read_bytes()
+          request = {
+              'request_id': 'ci-real-macos-http',
+              'filename': 'macho_console_fixture',
+              'binary_base64': base64.b64encode(binary).decode('ascii'),
+              'args': [],
+              'timeout_ms': 5000,
+              'authentication': {'method': 'Token', 'credential_ref': 'ci-node'},
+          }
+          Path('target/macos-node-execute-request.json').write_text(json.dumps(request), encoding='utf-8')
+          PY
+          curl --fail --silent --show-error --max-time 10 \
+            -H "X-Daoti-Token: $DAOTI_MACOS_NODE_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data-binary @target/macos-node-execute-request.json \
+            http://127.0.0.1:18767/execute | tee target/macos-node-real-evidence.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path('target/macos-node-real-evidence.log').read_text(encoding='utf-8'))
+          assert result['status'] == 'Succeeded', result
+          assert 'macho-runtime-ok' in result['stdout'], result
+          assert result['exit_code'] == 7, result
+          PY
+          cat target/macos-node-process.stderr
+      - name: macOS 真实节点单元验收
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p daoti-macos-node execute_requires_token_and_returns_process_result --lib -- --nocapture 2>&1 | tee target/macos-node-unit-evidence.log
+
+      - name: 上传 macOS 真实节点证据
+        if: runner.os == 'macOS' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-real-node-evidence
+          path: |
+            target/macos-node-real-evidence.log
+            target/macos-node-unit-evidence.log
+            target/macos-node-process.stdout
+            target/macos-node-process.stderr
+            target/macos-node-health.json
+            target/macos-node-execute-request.json
+          if-no-files-found: error
+
+      - name: Clippy 静态检查（拒绝所有警告）
+        run: cargo clippy --workspace -- -D warnings
+
+  # 三平台验收门禁：每个平台都必须通过真实构建/测试，不将 mock 当作能力证明
+  acceptance:
+    name: 三平台真实能力门禁 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+      - name: 检查能力注册表与统一报告契约
+        run: cargo test -p daoti-core executor::execution::tests --lib
+      - name: 能力探测门禁（仅记录真实探测结果）
+        run: cargo run -p daoti-cli -- capabilities
+      - name: CLI/daemon 入口契约
+        run: cargo run -p daoti-cli -- --help
+      - name: 验证全工作区可编译
+        run: cargo check --workspace
+
+  # 玄镜前端：Vite 生产构建 + 产物校验
+  frontend:
+    name: 玄镜前端构建
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: daoti-ui-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: daoti-ui-web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: Vite 生产构建
+        run: npm run build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: xuanjing-ui-dist
+          path: daoti-ui-web/dist/

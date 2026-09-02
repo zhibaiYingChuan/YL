@@ -1,0 +1,39 @@
+[package]
+name = "daoti-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "驭灵内核：常驻后台守护进程，静默监听三系统，Actor 编排。"
+
+[lib]
+name = "daoti_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "daoti-daemon"
+path = "src/main.rs"
+
+[features]
+default = []
+# 启用学习闭环（决策后 Hebbian 慢调节 + 参数库），转发 daoti-core 的 learning feature
+learning = ["daoti-core/learning"]
+
+[dependencies]
+daoti-common = { workspace = true }
+daoti-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tower-http = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

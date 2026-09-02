@@ -1,0 +1,29 @@
+[package]
+name = "daoti-core"
+version = "0.1.0"
+edition = "2021"
+description = "驭灵核心纯库：感知/推演/决策/执行，不包含 main，不启动 tokio 运行时，便于单元测试。"
+
+[dependencies]
+daoti-common = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+# 模式B B2 双梯形网络纯数学变换（Array1<f64> → Array1<f64>）
+ndarray = { workspace = true }
+
+# 系统信息采集（Windows 感知器可选）
+sysinfo = { workspace = true, optional = true }
+
+[features]
+default = []
+# 启用系统信息采集
+sysinfo = ["dep:sysinfo"]
+# 启用学习与参数库（决策轨迹持久化 + Hebbian 预留 + 参数库加载；默认关闭不影响主链路，见开发计划步骤 9）
+learning = []

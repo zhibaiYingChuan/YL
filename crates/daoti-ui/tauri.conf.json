@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "驭灵玄镜",
+  "version": "0.1.0",
+  "identifier": "com.yuling.daoti",
+  "build": {
+    "frontendDist": "../../daoti-ui-web/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "驭灵 · 玄镜",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:17890; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "language": "zh-CN"
+      }
+    },
+    "externalBin": [
+      "binaries/daoti-daemon",
+      "binaries/daoti"
+    ]
+  }
+}

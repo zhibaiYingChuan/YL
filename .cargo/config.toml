@@ -1,0 +1,22 @@
+[build]
+# 在 CI/受限环境下关闭增量编译抖动
+incremental = false
+
+# 驭灵专用 target 目录：覆盖全局 ~/.cargo/config.toml 的共享 target-dir（G:/rust-target），
+# 避免与其他项目（如玄盾）共享编译产物，防止 Tauri 打包时把无关项目的 DLL 一并打进安装包。
+target-dir = "g:/Yl/target"
+
+# Windows schannel 证书吊销检查失败（CRYPT_E_NO_REVOCATION_CHECK）的规避：
+# 关闭 http 证书吊销检查，改用国内镜像加速（用户位于中国区网络）。
+[http]
+check-revoke = false
+
+# crates.io 国内镜像（rsproxy.cn），加速依赖拉取并规避网络抖动
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

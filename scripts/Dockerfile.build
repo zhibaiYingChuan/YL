@@ -1,0 +1,12 @@
+# 驭灵跨平台构建验证环境（Linux 模拟，仅用于本地验证 build-release.sh）
+# 用法：
+#   docker build -f scripts/Dockerfile.build -t daoti-build .
+#   docker run --rm -v "$(pwd):/app" daoti-build bash /app/scripts/build-release.sh
+FROM rust:1.85
+
+# 前端构建需要 Node.js（脚本内 bun 优先、npm 兜底，此处装 npm 保证可用）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app

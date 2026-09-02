@@ -1,0 +1,373 @@
+/* 驭灵玄镜 · 主题系统
+   依据《驭灵 UIUX 设计规范.md》第六节 CSS Tokens 与第一/二节色彩组件规范。 */
+
+:root {
+  /* 基础 */
+  --yl-bg-primary: #0B0E14;
+  --yl-bg-secondary: #131A24;
+  --yl-border-subtle: #1C2738;
+
+  /* 主题色 */
+  --yl-gold: #D4A84B;
+  --yl-gold-hover: #F0D080;
+  --yl-gold-press: #8A6E2E;
+  --yl-cyan: #3ECF9E;
+  --yl-cyan-soft: #66D9B0;
+  --yl-crimson: #E85C5C;
+  --yl-crimson-soft: #FF8A8A;
+  --yl-earth: #9C8C70;
+  --yl-earth-line: #6B5D45;
+
+  /* 字体灰度 */
+  --yl-text-primary: #E6E8EC;
+  --yl-text-secondary: #9BA4B4;
+  --yl-text-muted: #5A6375;
+
+  /* 排版 */
+  --yl-font-sans: 'Noto Sans SC', 'Inter', sans-serif;
+  --yl-font-mono: 'JetBrains Mono', 'LXGW WenKai', monospace;
+
+  /* 圆角-气韵 */
+  --yl-radius-sm: 4px;
+  --yl-radius-md: 8px;
+  --yl-radius-lg: 16px;
+
+  /* 阴影-悬浮感 */
+  --yl-shadow-glow: 0px 8px 32px rgba(212, 168, 75, 0.08);
+
+  /* 动效-静水流深 */
+  --yl-ease-flow: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --yl-dur: 300ms;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background: var(--yl-bg-primary);
+  color: var(--yl-text-primary);
+  font-family: var(--yl-font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* 布局：左符（导航） / 右玄（内容） / 底爻（状态） */
+.yl-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 1fr auto;
+  grid-template-areas:
+    "nav main"
+    "nav status";
+  height: 100vh;
+}
+
+.yl-nav {
+  grid-area: nav;
+  background: var(--yl-bg-secondary);
+  border-right: 1px solid var(--yl-border-subtle);
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.yl-brand {
+  font-size: 20px;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+  color: var(--yl-gold);
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.yl-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--yl-radius-md);
+  color: var(--yl-text-secondary);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all var(--yl-dur) var(--yl-ease-flow);
+  background: none;
+  font-family: var(--yl-font-sans);
+  font-size: 14px;
+  text-align: left;
+}
+
+.yl-nav-item:hover {
+  color: var(--yl-gold-hover);
+  background: rgba(212, 168, 75, 0.06);
+}
+
+.yl-nav-item.active {
+  color: var(--yl-gold);
+  border-color: var(--yl-gold);
+  background: rgba(212, 168, 75, 0.10);
+}
+
+.yl-main {
+  grid-area: main;
+  padding: 24px 28px;
+  overflow: auto;
+}
+
+.yl-status {
+  grid-area: status;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 28px;
+  border-top: 1px solid var(--yl-border-subtle);
+  background: var(--yl-bg-secondary);
+  font-family: var(--yl-font-mono);
+  font-size: 12px;
+  color: var(--yl-text-secondary);
+}
+
+/* 气运卡片 */
+.yl-card {
+  background: var(--yl-bg-secondary);
+  border: 1px solid var(--yl-border-subtle);
+  border-radius: var(--yl-radius-lg);
+  padding: 20px;
+  box-shadow: var(--yl-shadow-glow);
+}
+
+.yl-card-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* 呼吸灯 */
+.yl-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.yl-dot.ok { background: var(--yl-cyan); box-shadow: 0 0 8px var(--yl-cyan); animation: breathe 3s ease-in-out infinite; }
+.yl-dot.warn { background: var(--yl-gold); box-shadow: 0 0 8px var(--yl-gold); animation: pulse 1.6s ease-in-out infinite; }
+.yl-dot.err { background: var(--yl-crimson); box-shadow: 0 0 8px var(--yl-crimson); animation: blink 1s step-end infinite; }
+.yl-dot.muted { background: var(--yl-text-muted); }
+
+@keyframes breathe { 0%,100% { opacity: 1; transform: scale(1);} 50% { opacity: 0.7; transform: scale(1.15);} }
+@keyframes pulse { 0%,100% { opacity: 1;} 50% { opacity: 0.4;} }
+@keyframes blink { 0%,100% { opacity: 1;} 50% { opacity: 0.2;} }
+
+/* 五行状态徽章（圆角菱形） */
+.yl-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  transform: rotate(0deg);
+  border-radius: 2px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.yl-badge.gold { background: var(--yl-gold); color: #000; }
+.yl-badge.wood { background: var(--yl-cyan); color: #000; }
+.yl-badge.water { background: var(--yl-bg-primary); color: var(--yl-text-primary); border: 1px solid var(--yl-border-subtle); }
+.yl-badge.fire { background: var(--yl-crimson); color: #fff; }
+.yl-badge.earth { background: var(--yl-earth); color: #fff; }
+
+/* 驭灵按钮 */
+.yl-btn {
+  background: transparent;
+  color: var(--yl-gold);
+  border: 1px solid var(--yl-gold);
+  padding: 8px 18px;
+  border-radius: var(--yl-radius-md);
+  cursor: pointer;
+  font-family: var(--yl-font-sans);
+  font-size: 14px;
+  transition: all var(--yl-dur) var(--yl-ease-flow);
+}
+.yl-btn:hover { background: rgba(212, 168, 75, 0.10); border-color: var(--yl-gold-hover); color: var(--yl-gold-hover); }
+.yl-btn:disabled { border-color: var(--yl-gold-press); color: var(--yl-gold-press); cursor: not-allowed; }
+
+/* 玄启按钮：金→青 45° 渐变 */
+.yl-btn-xuanqi {
+  background: linear-gradient(45deg, var(--yl-gold), var(--yl-cyan));
+  color: #000;
+  border: none;
+  font-weight: 700;
+}
+.yl-btn-xuanqi:hover { background: linear-gradient(45deg, var(--yl-gold-hover), var(--yl-cyan-soft)); color: #000; }
+
+/* 时间轴 */
+.yl-timeline {
+  position: relative;
+  padding-left: 24px;
+  border-left: 2px solid var(--yl-earth-line);
+}
+.yl-tl-item {
+  display: flex;
+  gap: 12px;
+  padding: 10px 0;
+  position: relative;
+}
+.yl-tl-item::before {
+  content: "";
+  position: absolute;
+  left: -29px;
+  top: 16px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--yl-gold);
+}
+.yl-tl-time { font-family: var(--yl-font-mono); font-size: 12px; color: var(--yl-text-muted); white-space: nowrap; }
+.yl-tl-body { color: var(--yl-text-secondary); }
+
+/* 三气归元图 */
+.yl-rings {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 40px;
+  padding: 20px 0;
+}
+.yl-ring {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.yl-ring-circle {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+.yl-ring-circle.win { border: 3px solid var(--yl-gold); color: var(--yl-gold); }
+.yl-ring-circle.wsl { border: 3px solid var(--yl-cyan); color: var(--yl-cyan); }
+.yl-ring-circle.docker { border: 3px solid var(--yl-crimson); color: var(--yl-crimson); }
+.yl-ring-name { font-size: 13px; color: var(--yl-text-secondary); }
+
+/* 推演记录 */
+.yl-records { display: flex; flex-direction: column; gap: 12px; }
+.yl-record {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--yl-border-subtle);
+  border-radius: var(--yl-radius-md);
+  animation: fadein var(--yl-dur) var(--yl-ease-flow);
+}
+@keyframes fadein { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: none;} }
+
+/* 判词 */
+.yl-verdict {
+  font-family: var(--yl-font-mono);
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--yl-gold);
+  margin-bottom: 16px;
+}
+
+/* 网格 */
+.yl-grid { display: grid; gap: 20px; }
+.yl-grid-col2 { grid-template-columns: 1fr 1fr; }
+.yl-toolbar { display: flex; gap: 12px; margin-bottom: 20px; }
+
+/* 快照回魂 */
+.yl-snap-list { display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow: auto; }
+.yl-snap-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--yl-bg-primary);
+  border: 1px solid var(--yl-border-subtle);
+  border-radius: var(--yl-radius-md);
+  cursor: pointer;
+  text-align: left;
+  transition: all var(--yl-dur) var(--yl-ease-flow);
+}
+.yl-snap-item:hover { border-color: var(--yl-gold-hover); }
+.yl-snap-item.active { border-color: var(--yl-gold); background: rgba(212, 168, 75, 0.06); }
+.yl-snap-item-diff { margin-top: 4px; padding: 4px 0; font-size: 12px; color: var(--yl-gold); text-align: right; cursor: pointer; transition: color var(--yl-dur) var(--yl-ease-flow); }
+.yl-snap-item-diff:hover { color: var(--yl-gold-hover); text-decoration: underline; }
+.yl-snap-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.yl-verdict-sm { font-size: 12px; color: var(--yl-text-secondary); }
+.yl-snap-item-bars { display: flex; flex-direction: column; gap: 6px; }
+.yl-snap-bar { display: flex; align-items: center; gap: 10px; }
+.yl-snap-bar-label { width: 64px; font-size: 12px; color: var(--yl-text-secondary); }
+.yl-snap-bar-track { flex: 1; height: 6px; background: var(--yl-bg-primary); border-radius: 3px; overflow: hidden; }
+.yl-snap-bar-fill { height: 100%; border-radius: 3px; transition: width var(--yl-dur) var(--yl-ease-flow); }
+.yl-snap-bar-fill.ok { background: var(--yl-cyan); }
+.yl-snap-bar-fill.warn { background: var(--yl-gold); }
+.yl-snap-bar-fill.err { background: var(--yl-crimson); }
+.yl-snap-bar-num { width: 40px; font-family: var(--yl-font-mono); font-size: 12px; color: var(--yl-text-secondary); text-align: right; }
+
+.yl-snap-detail { display: flex; flex-direction: column; gap: 16px; }
+.yl-snap-detail-sys { border: 1px solid var(--yl-border-subtle); border-radius: var(--yl-radius-md); padding: 14px 16px; }
+.yl-snap-detail-title { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-weight: 700; }
+.yl-snap-detail-body { display: flex; flex-direction: column; gap: 6px; }
+.yl-snap-detail-row { display: flex; justify-content: space-between; font-family: var(--yl-font-mono); font-size: 12px; color: var(--yl-text-secondary); }
+
+/* ══════ P0-7 一键修复面板 ══════ */
+.yl-heal-btn {
+  display: block; margin: 16px auto; padding: 12px 32px;
+  border: 2px solid var(--yl-cyan); border-radius: var(--yl-radius-sm);
+  background: transparent; color: var(--yl-cyan); font-family: var(--yl-font-sans);
+  font-size: 16px; cursor: pointer; transition: all 0.2s;
+}
+.yl-heal-btn:hover { background: var(--yl-cyan); color: var(--yl-bg-primary); }
+.yl-heal-btn:disabled { border-color: var(--yl-text-muted); color: var(--yl-text-muted); cursor: wait; }
+
+.yl-heal-result { margin-top: 20px; padding: 20px; border-radius: var(--yl-radius-md); border: 1px solid var(--yl-border-subtle); }
+.yl-heal-result.yl-heal-ok { border-color: var(--yl-cyan); }
+.yl-heal-result.yl-heal-warn { border-color: var(--yl-gold); }
+.yl-heal-result.yl-heal-err { border-color: var(--yl-crimson); }
+
+.yl-heal-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.yl-heal-icon { font-size: 24px; }
+.yl-heal-outcome { font-size: 20px; font-weight: 700; }
+
+.yl-heal-bars { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+
+.yl-heal-verdict { font-family: var(--yl-font-mono); color: var(--yl-text-secondary); margin-bottom: 16px; }
+
+.yl-heal-details { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+.yl-heal-detail { display: flex; align-items: flex-start; gap: 8px; font-family: var(--yl-font-mono); font-size: 13px; padding: 6px 10px; border-radius: var(--yl-radius-sm); }
+.yl-heal-detail.yl-heal-ok { background: rgba(62, 207, 158, 0.08); }
+.yl-heal-detail.yl-heal-err { background: rgba(232, 92, 92, 0.08); }
+.yl-heal-detail-target { color: var(--yl-text-muted); flex-shrink: 0; }
+.yl-heal-detail-msg { color: var(--yl-crimson-soft); font-size: 12px; word-break: break-all; }
+
+.yl-heal-recovery { background: rgba(212, 168, 75, 0.08); border: 1px solid var(--yl-gold); border-radius: var(--yl-radius-md); padding: 14px 16px; }
+.yl-heal-recovery-title { color: var(--yl-gold); font-weight: 700; margin-bottom: 8px; }
+.yl-heal-recovery-line { color: var(--yl-text-secondary); font-size: 13px; line-height: 1.7; font-family: var(--yl-font-mono); }
+
+/* ══════ P0-2 首次运行设置 ══════ */
+.yl-setup-banner {
+  border-left: 3px solid var(--yl-gold);
+  margin-bottom: 24px;
+  padding: 20px 24px;
+}
+.yl-setup-banner .yl-card-title { margin-bottom: 12px; }
+.yl-setup-banner code {
+  background: var(--yl-bg-secondary); color: var(--yl-cyan);
+  padding: 2px 6px; border-radius: var(--yl-radius-sm);
+  font-family: var(--yl-font-mono); font-size: 12px;
+}
