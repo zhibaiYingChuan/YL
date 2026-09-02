@@ -14,7 +14,9 @@ use daoti_common::DaotiError;
 
 use super::Injector;
 use crate::injector::InjectionResult;
-use crate::interceptor::{InjectResult, TargetSyscall};
+#[cfg(target_os = "windows")]
+use crate::interceptor::InjectResult;
+use crate::interceptor::TargetSyscall;
 
 /// Windows 注入器实现
 ///

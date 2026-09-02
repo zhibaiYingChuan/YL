@@ -60,6 +60,8 @@ pub fn run_full_cycle(
 
     // 先解析二进制格式，确认支持
     let binary_info = crate::parser::parse_binary(binary_path)?;
+    #[cfg(not(target_os = "windows"))]
+    let _ = &binary_info;
 
     #[cfg(target_os = "windows")]
     if binary_info.binary_type == crate::parser::BinaryType::Elf {

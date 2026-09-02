@@ -68,10 +68,7 @@ impl PtraceCaptureSource {
     ///
     /// 在非 Linux 平台始终返回 `PermissionDenied` 错误。
     #[cfg(target_os = "linux")]
-    pub fn spawn(path: &str, args: &[&str]) -> Result<Self, DaotiError> {
-        use std::ffi::CString;
-        use std::os::unix::process::CommandExt;
-
+    pub fn spawn(_path: &str, _args: &[&str]) -> Result<Self, DaotiError> {
         // 使用 unsafe 包装 ptrace 系统调用
         // 实际实现中需要 libc 或 nix crate 的 ptrace 封装
         //
@@ -96,7 +93,7 @@ impl PtraceCaptureSource {
 
     /// 从已附加的进程 PID 创建捕获源（供调试/测试用）。
     #[cfg(target_os = "linux")]
-    pub fn attach(pid: i32) -> Result<Self, DaotiError> {
+    pub fn attach(_pid: i32) -> Result<Self, DaotiError> {
         // 1. ptrace(PTRACE_ATTACH, pid)
         // 2. waitpid(pid)
         // 3. 确定架构
@@ -198,7 +195,7 @@ impl SyscallCaptureSource for PtraceCaptureSource {
         {
             // 如果正在等待 exit，先捕获 exit 事件
             if let Some(nr) = self.waiting_exit.take() {
-                let ret = self.read_ret_value()?;
+                let _ret = self.read_ret_value()?;
                 self.continue_to_syscall()?;
                 let ev = SyscallEvent::new(
                     nr as i32,
@@ -221,7 +218,7 @@ impl SyscallCaptureSource for PtraceCaptureSource {
 
             // 继续等待 exit
             self.continue_to_syscall()?;
-            let ret = self.read_ret_value()?;
+            let _ret = self.read_ret_value()?;
             self.waiting_exit = None;
 
             let ev = SyscallEvent::new(

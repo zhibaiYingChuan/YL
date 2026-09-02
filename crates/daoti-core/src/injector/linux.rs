@@ -78,6 +78,7 @@ impl LinuxInjector {
 
     /// 读取 syscall 返回值
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     fn read_ret_value(&self) -> Result<i64, DaotiError> {
         // 1. ptrace(PTRACE_GETREGS, pid, 0, &regs)
         // 2. 返回 regs.rax
@@ -88,6 +89,7 @@ impl LinuxInjector {
 
     /// 写入目标进程内存
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     fn write_memory(&self, _addr: u64, _data: &[u8]) -> Result<(), DaotiError> {
         // 1. 按 word 对齐，逐个 ptrace(PTRACE_POKEDATA, pid, addr, word)
         Err(DaotiError::PermissionDenied(
@@ -97,6 +99,7 @@ impl LinuxInjector {
 
     /// 读取目标进程内存
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     fn read_memory(&self, _addr: u64, _size: usize) -> Result<Vec<u8>, DaotiError> {
         // 1. 逐个 ptrace(PTRACE_PEEKDATA, pid, addr, 0)
         Err(DaotiError::PermissionDenied(

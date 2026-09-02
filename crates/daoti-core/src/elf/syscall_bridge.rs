@@ -1358,7 +1358,7 @@ mod tests {
         );
         // 新增区间 [0x2000, 0x3000) 真实可读写（不依赖解释器容错路径）
         assert!(memory.write(0x2ff0, &[0x5a; 16]).is_ok());
-        assert_eq!(&memory.read(0x2ff0, 16).unwrap()[..], &[0x5a; 16][..]);
+        assert_eq!(memory.read(0x2ff0, 16).unwrap(), [0x5a; 16]);
         // 断点查询反映扩展
         assert_eq!(
             bridge.handle_with_memory(&query, &mut memory).unwrap(),

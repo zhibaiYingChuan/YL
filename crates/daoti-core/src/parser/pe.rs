@@ -956,7 +956,7 @@ mod tests {
     }
 
     fn create_self_contained_pe_fixture() -> Vec<u8> {
-        let image_base = 0x1400_0000_0u64;
+        let image_base = 0x0001_4000_0000_u64;
         let pe_offset = 0x80usize;
         let section_raw = 0x200usize;
         let section_rva = 0x1000u32;

@@ -856,6 +856,23 @@ fn read_u64(memory: &MemoryModel, address: u64) -> Result<u64, DaotiError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn permissions(prot: u64) -> String {
+    let mut value = String::new();
+    if prot & 1 != 0 {
+        value.push('r');
+    }
+    if prot & 2 != 0 {
+        value.push('w');
+    }
+    if prot & 4 != 0 {
+        value.push('x');
+    }
+    if value.is_empty() {
+        value.push('-');
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,21 +928,4 @@ mod tests {
         assert_eq!(handler.captured_stdout(), b"Hello from libc!");
         assert_eq!(audit.records(), vec!["write:Hello from libc!".to_string()]);
     }
-}
-
-fn permissions(prot: u64) -> String {
-    let mut value = String::new();
-    if prot & 1 != 0 {
-        value.push('r');
-    }
-    if prot & 2 != 0 {
-        value.push('w');
-    }
-    if prot & 4 != 0 {
-        value.push('x');
-    }
-    if value.is_empty() {
-        value.push('-');
-    }
-    value
 }
