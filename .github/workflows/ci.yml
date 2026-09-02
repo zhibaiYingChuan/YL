@@ -98,7 +98,22 @@ jobs:
           DAOTI_DYNAMIC_RUNTIME_ROOT: ${{ github.workspace }}
           DAOTI_DYNAMIC_RUNTIME_FIXTURE: ${{ github.workspace }}\target\et_dyn_console_fixture
           DAOTI_DYNAMIC_RUNTIME_EVIDENCE: passed
-        run: cargo test -p daoti-cli --test cli_smoke --no-default-features
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logPath = 'target/windows-dynamic-cli.log'
+          cargo run -p daoti-cli -- run $env:DAOTI_DYNAMIC_RUNTIME_FIXTURE *> $logPath
+          $cliExitCode = $LASTEXITCODE
+          Get-Content -LiteralPath $logPath -Encoding UTF8
+          if ($cliExitCode -ne 0) { throw "Windows 动态 ELF CLI 失败，退出码=$cliExitCode；详见 $logPath" }
+          cargo test -p daoti-cli --test cli_smoke --no-default-features -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Windows 动态 ELF smoke 测试失败' }
+      - name: 上传 Windows 动态 ELF 诊断日志
+        if: runner.os == 'Windows' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dynamic-elf-diagnostics
+          path: target/windows-dynamic-cli.log
+          if-no-files-found: ignore
       - name: Linux CLI 验收真实 ET_DYN fixture
         if: runner.os == 'Linux'
         shell: bash
