@@ -51,26 +51,23 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/build-et-dyn-fixture.sh
-      - name: 生成真实 ET_DYN fixture（Windows，WSL 工具链）
+      - name: 生成真实 ET_DYN fixture（Windows，Zig 交叉工具链）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $wslRoot = (wsl wslpath '${{ github.workspace }}').Trim()
-          if (-not $wslRoot) { throw 'WSL 未安装或未配置发行版；ET_DYN 真实构建无法验收' }
-          wsl bash -lc "cd '$wslRoot' && bash scripts/build-et-dyn-fixture.sh 'target/et_dyn_console_fixture'"
-          if (-not (Test-Path "${{ github.workspace }}\target\et_dyn_console_fixture")) { throw 'WSL 未产出 ET_DYN fixture' }
+          zig cc -target x86_64-linux -c -fPIC -nostdlib `
+            -o target/et_dyn_console_fixture.o `
+            tests/fixtures/et_dyn_console.S
+          zig cc -target x86_64-linux -nostdlib -pie `
+            -Wl,--build-id=none -Wl,-e,_start `
+            -o target/et_dyn_console_fixture `
+            target/et_dyn_console_fixture.o
+          Remove-Item -LiteralPath target/et_dyn_console_fixture.o -Force
+          if (-not (Test-Path -LiteralPath "${{ github.workspace }}\target\et_dyn_console_fixture")) { throw 'Zig 未产出 ET_DYN fixture' }
       - name: 生成真实 TLS 动态 ELF fixture（Linux 工具链）
         if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/build-tls-dynamic-fixture.sh target/tls_dynamic
-      - name: 生成真实 TLS 动态 ELF fixture（Windows，WSL 工具链）
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $wslRoot = (wsl wslpath '${{ github.workspace }}').Trim()
-          if (-not $wslRoot) { throw 'WSL 未安装或未配置发行版；TLS 真实构建无法验收' }
-          wsl bash -lc "cd '$wslRoot' && bash scripts/build-tls-dynamic-fixture.sh 'target/tls_dynamic'"
-          if (-not (Test-Path "${{ github.workspace }}\target\tls_dynamic")) { throw 'WSL 未产出 TLS fixture' }
       - name: Linux 验收真实 TLS 动态取址链
         if: runner.os == 'Linux'
         shell: bash
@@ -78,12 +75,6 @@ jobs:
           DAOTI_TRACE_TLS: '1'
         run: |
           cargo test -p daoti-core --lib load_and_run_real_tls_dynamic_chain -- --ignored --nocapture
-      - name: Windows 验收真实 TLS 动态取址链
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          DAOTI_TRACE_TLS: '1'
-        run: cargo test -p daoti-core --lib load_and_run_real_tls_dynamic_chain -- --ignored --nocapture
 
       - name: Windows CLI 验收真实动态 ELF fixture
         if: runner.os == 'Windows'
