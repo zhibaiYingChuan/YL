@@ -182,8 +182,15 @@ mod tests {
     fn test_linux_injector_inject_on_non_linux() {
         let injector = LinuxInjector::new_internal(0);
         let target = TargetSyscall::new("read", "读文件");
-        let result = injector.inject(&target);
         #[cfg(not(target_os = "linux"))]
-        assert!(result.is_err(), "非 Linux 平台应返回错误");
+        {
+            let result = injector.inject(&target);
+            assert!(result.is_err(), "非 Linux 平台应返回错误");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Linux 上注入器为占位实现，仅验证调用路径可执行不 panic
+            let _result = injector.inject(&target);
+        }
     }
 }

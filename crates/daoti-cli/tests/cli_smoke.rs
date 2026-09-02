@@ -1,6 +1,8 @@
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
