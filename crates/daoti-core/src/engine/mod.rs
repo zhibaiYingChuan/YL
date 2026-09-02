@@ -197,6 +197,29 @@ mod tests {
     use crate::interceptor::SyscallEvent;
     use std::path::PathBuf;
 
+    fn test_elf_path() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("daoti-engine-{}.elf", std::process::id()));
+        let mut data = vec![0u8; 120];
+        data[0..4].copy_from_slice(b"\x7fELF");
+        data[4] = 2;
+        data[5] = 1;
+        data[16..18].copy_from_slice(&2u16.to_le_bytes());
+        data[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+        data[20..24].copy_from_slice(&1u32.to_le_bytes());
+        data[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+        data[32..40].copy_from_slice(&64u64.to_le_bytes());
+        data[52..54].copy_from_slice(&64u16.to_le_bytes());
+        data[54..56].copy_from_slice(&56u16.to_le_bytes());
+        data[56..58].copy_from_slice(&1u16.to_le_bytes());
+        data[64..68].copy_from_slice(&1u32.to_le_bytes());
+        data[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+        data[96..104].copy_from_slice(&0x1000u64.to_le_bytes());
+        data[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+        data[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+        std::fs::write(&path, data).expect("应能写入测试 ELF");
+        path
+    }
+
     #[test]
     fn test_engine_default_creation() {
         let engine = LocalEngine::default();
@@ -226,7 +249,7 @@ mod tests {
         let source = MockCaptureSource::new(events);
 
         // 需要一个可读的二进制路径
-        let path = std::env::current_exe().expect("应能获取测试可执行文件路径");
+        let path = test_elf_path();
         let report = engine.execute(&path, Box::new(source)).expect("执行应成功");
 
         assert_eq!(report.total_captured, 3, "应捕获 3 个 syscall");
@@ -247,7 +270,7 @@ mod tests {
         ];
         let source = MockCaptureSource::new(events);
 
-        let path = std::env::current_exe().expect("应能获取测试可执行文件路径");
+        let path = test_elf_path();
         let report = engine.execute(&path, Box::new(source)).expect("执行应成功");
 
         assert_eq!(report.total_captured, 3);
@@ -262,7 +285,7 @@ mod tests {
         let engine = LocalEngine::default();
         let source = MockCaptureSource::new(vec![]);
 
-        let path = std::env::current_exe().expect("应能获取测试可执行文件路径");
+        let path = test_elf_path();
         let report = engine.execute(&path, Box::new(source)).expect("执行应成功");
 
         assert_eq!(report.total_captured, 0);

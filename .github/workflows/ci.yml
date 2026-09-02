@@ -59,6 +59,10 @@ jobs:
           zig cc -target x86_64-linux -nostdlib -pie '-Wl,--build-id=none' '-Wl,-e,_start' -o target/et_dyn_console_fixture target/et_dyn_console_fixture.o
           Remove-Item -LiteralPath target/et_dyn_console_fixture.o -Force
           if (-not (Test-Path -LiteralPath "${{ github.workspace }}\target\et_dyn_console_fixture")) { throw 'Zig 未产出 ET_DYN fixture' }
+      - name: 生成 glibc 道体权重（Linux 验收前置）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
       - name: 生成真实 TLS 动态 ELF fixture（Linux 工具链）
         if: runner.os == 'Linux'
         shell: bash

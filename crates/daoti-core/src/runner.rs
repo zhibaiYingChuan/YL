@@ -62,26 +62,29 @@ mod tests {
 
     #[tokio::test]
     async fn runs_echo_like_command() {
-        // 用当前可执行文件自身模拟"输出"：返回 0 行输出
-        let out = run_with_timeout("cmd", &["/C", "echo", "ok"], Duration::from_secs(5)).await;
-        // 仅验证不报错（是否含 "ok" 取决于 echo 行为，宽松断言）
-        assert!(out.is_ok());
+        #[cfg(windows)]
+        let (program, args) = ("cmd", vec!["/C", "echo", "ok"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("printf", vec!["ok\\n"]);
+        let out = run_with_timeout(program, &args, Duration::from_secs(5)).await;
+        assert!(out.expect("平台回显命令应成功").contains("ok"));
     }
 
     #[tokio::test]
     async fn times_out_for_sleep() {
-        // 用 PowerShell Start-Sleep 模拟卡死，验证 timeout 真正触发
-        let r = run_with_timeout(
+        #[cfg(windows)]
+        let (program, args) = (
             "powershell",
-            &[
+            vec![
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
                 "Start-Sleep -Seconds 5",
             ],
-            Duration::from_millis(100),
-        )
-        .await;
+        );
+        #[cfg(not(windows))]
+        let (program, args) = ("sleep", vec!["5"]);
+        let r = run_with_timeout(program, &args, Duration::from_millis(100)).await;
         assert!(r.is_err(), "应因超时而失败，实际返回 Ok");
         assert!(matches!(r, Err(DaotiError::CommandTimeout { .. })));
     }

@@ -3022,6 +3022,7 @@ mod tests {
         assert_eq!(absolutize(&memory, load_bias, 0x25c7_0000), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn load_and_run_minimal_dynamic_hello_uses_native_interpreter() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3105,6 +3106,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn load_and_run_dynamic_hello_uses_native_interpreter_and_audit() {
         let root =
@@ -3595,6 +3597,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_combined_dynamic_merges_dependency_ptload_and_cross_object_reloc() {
         with_fixtures(|dir| {
@@ -3645,6 +3648,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_real_hello_dynamic_uses_page_aligned_pt_load_ranges() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3668,6 +3672,7 @@ mod tests {
             .any(|symbol| symbol.name == "__libc_start_main"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_combined_dynamic_auxv_contains_entry() {
         with_fixtures(|dir| {
