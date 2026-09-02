@@ -184,7 +184,7 @@ jobs:
             target/macos-node-process.stderr
             target/macos-node-health.json
             target/macos-node-execute-request.json
-          if-no-files-found: error
+          if-no-files-found: ignore
 
       - name: Clippy 静态检查（拒绝所有警告）
         run: cargo clippy --workspace -- -D warnings
