@@ -17,6 +17,19 @@ fn default_source_evidence_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("knowledge/main_map_source_evidence.jsonl"))
 }
 
+// 确保输出文件父目录存在；CI 干净 checkout 中 knowledge/ 目录可能未被跟踪。
+fn ensure_parent_dir(path: &Path) -> Result<(), daoti_core::DaotiError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            daoti_core::DaotiError::Other(format!(
+                "创建输出目录失败（{}）：{error}",
+                parent.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), daoti_core::DaotiError> {
     let output = std::env::args()
         .nth(1)
@@ -36,8 +49,10 @@ fn main() -> Result<(), daoti_core::DaotiError> {
         .collect::<Vec<_>>();
     samples.extend(source_samples.iter().cloned());
 
+    ensure_parent_dir(Path::new(&output))?;
     write_jsonl(Path::new(&output), &samples)?;
     if !source_samples.is_empty() {
+        ensure_parent_dir(source_output)?;
         write_jsonl(source_output, &source_samples)?;
     }
     println!(
@@ -62,6 +77,7 @@ fn main() -> Result<(), daoti_core::DaotiError> {
     }
     let weights_bytes = weights.to_bytes();
     let weights_path = Path::new("knowledge/glibc_network.daotiblt");
+    ensure_parent_dir(weights_path)?;
     std::fs::write(weights_path, &weights_bytes)
         .map_err(|error| daoti_core::DaotiError::Other(format!("写出 glibc 权重失败：{error}")))?;
     println!(

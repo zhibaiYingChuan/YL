@@ -56,13 +56,29 @@ jobs:
         shell: pwsh
         run: |
           zig cc -target x86_64-linux -c -fPIC -nostdlib -o target/et_dyn_console_fixture.o tests/fixtures/et_dyn_console.S
+          if ($LASTEXITCODE -ne 0) { throw 'zig cc -c 编译 ET_DYN fixture 失败' }
           zig cc -target x86_64-linux -nostdlib -pie '-Wl,--build-id=none' '-Wl,-e,_start' -o target/et_dyn_console_fixture target/et_dyn_console_fixture.o
-          Remove-Item -LiteralPath target/et_dyn_console_fixture.o -Force
+          if ($LASTEXITCODE -ne 0) { throw 'zig cc 链接 ET_DYN fixture 失败' }
+          Remove-Item -LiteralPath target/et_dyn_console_fixture.o -Force -ErrorAction SilentlyContinue
           if (-not (Test-Path -LiteralPath "${{ github.workspace }}\target\et_dyn_console_fixture")) { throw 'Zig 未产出 ET_DYN fixture' }
       - name: 生成 glibc 道体权重（Linux 验收前置）
         if: runner.os == 'Linux'
         shell: bash
         run: cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
+      - name: 生成 glibc 道体权重（Windows 验收前置）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
+          if ($LASTEXITCODE -ne 0) { throw 'glibc 道体权重生成失败' }
+          if (-not (Test-Path -LiteralPath knowledge/glibc_network.daotiblt)) { throw 'glibc 道体权重文件不存在' }
+      - name: 生成真实静态 glibc/musl ELF（Windows，Zig 交叉工具链）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          zig cc -target x86_64-linux-musl -static -O0 -o hello_libc.elf hello_libc.c
+          if ($LASTEXITCODE -ne 0) { throw 'zig cc 编译 hello_libc.elf 失败' }
+          if (-not (Test-Path -LiteralPath hello_libc.elf)) { throw 'Zig 未产出 hello_libc.elf' }
       - name: 生成真实 TLS 动态 ELF fixture（Linux 工具链）
         if: runner.os == 'Linux'
         shell: bash

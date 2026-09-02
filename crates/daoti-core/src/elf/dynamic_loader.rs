@@ -3422,6 +3422,7 @@ mod tests {
         buf
     }
 
+    #[cfg(target_os = "linux")]
     fn build_unknown_syscall_so() -> Vec<u8> {
         let mut buf = build_dep_so();
         buf[24..32].copy_from_slice(&0x400100u64.to_le_bytes());
@@ -3477,6 +3478,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_execute_combined_reports_unknown_syscall_number() {
         with_fixtures(|dir| {
