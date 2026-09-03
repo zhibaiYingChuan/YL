@@ -121,6 +121,7 @@ jobs:
           DAOTI_TRACE_DLMAIN: '1'
           DAOTI_TRACE_LINK_MAP_INFO_SCAN: '1'
           DAOTI_TRACE_NS_LOADED_WRITE: '1'
+          DAOTI_TRACE_SYSCALLS: '1'
         run: |
           set +e
           cargo test -p daoti-core --lib load_and_run_real_glibc_hello_uses_stdout_and_exit_zero -- --ignored --nocapture > target/glibc-hello-contract.log 2>&1
@@ -136,6 +137,8 @@ jobs:
             target/hello_glibc
             target/hello_glibc_manifest.txt
             target/glibc-hello-contract.log
+            target/ld-linux-x86-64.so.2
+            target/libc.so.6
           if-no-files-found: ignore
 
       - name: Windows CLI 验收真实动态 ELF fixture

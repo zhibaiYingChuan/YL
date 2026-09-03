@@ -1984,34 +1984,71 @@ where
         ))?;
 
         // 5.5 初始化 ld-linux 引导分配器（bump allocator）的全局状态。
-        // glibc 的 __minimal_malloc 在启动早期检查 [rip+disp] alloc_end 全局；若为 0，
-        // 它立即返回 NULL（rtld.c:1712 main_map != NULL 断言）。必须在任何 calloc 前
-        // 把 alloc_ptr/alloc_end 指向运行时堆，分配器才能成功返回非零 link_map。
+        // glibc 的 __minimal_malloc 在启动早期检查 alloc_end 全局；若为 0，
+        // 它会把 alloc_ptr 指向 &_end 并按页对齐 alloc_end。此时若 ld.so 的
+        // BSS 末尾页内剩余空间不足首次请求大小，分配器将立即走 __mmap 扩容；
+        // 任何失败路径都会让 _dl_new_object 的 calloc 返回 NULL，进而触发
+        // dl_main 的 main_map != NULL 断言（rtld.c:1639）以 127 退出。
+        // 必须在任何 calloc 前把 alloc_ptr/alloc_end 指向运行时 bump 区，
+        // 分配器才能成功返回非零 link_map。
+        //
+        // 偏移来源：不再硬编码 glibc 2.35 布局（2.39 存在漂移），改为从
+        // ld-linux 自身 .symtab 动态发现 alloc_end/alloc_ptr 与
+        // __rtld_malloc/__rtld_free/__rtld_realloc/__rtld_calloc 的真实偏移。
+        // 引导分配器是 BSS 中的 static 状态，没有任何 relocation 会初始化它，
+        // 只有符号表能给出稳定可验证的目标地址。
         if let Some(interp) = &interpreter {
-            // alloc_end 映射：mov rdx,[rip+0x29a90] @ 0xa6e9 → l_bias + 0x34180
-            // alloc_ptr 映射：mov rax,[rip+0x29a88] @ 0xa6f9 → l_bias + 0x34188
             let bias = interp.plan.load_bias;
-            let alloc_end_addr = bias + 0x34180;
-            let alloc_ptr_addr = bias + 0x34188;
+            let syms = super::read_full_symtab_symbols(&interp.bytes).unwrap_or_default();
+            let lookup = |name: &str| {
+                syms.iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, value)| *value)
+            };
+            // 目标函数（__rtld_* 指针的写入值）：minimal 分配器入口。
+            let minimal_malloc = lookup("__minimal_malloc");
+            let minimal_free = lookup("__minimal_free");
+            let minimal_realloc = lookup("__minimal_realloc");
+            let minimal_calloc = lookup("__minimal_calloc");
+            // 目标变量地址；符号表缺失时回退 2.35 时代硬编码（并留 TRACE 告警）。
+            let alloc_end_addr = lookup("alloc_end")
+                .map(|offset| bias + offset)
+                .unwrap_or(bias + 0x34180);
+            let alloc_ptr_addr = lookup("alloc_ptr")
+                .map(|offset| bias + offset)
+                .unwrap_or(bias + 0x34188);
+            let alloc_end_found = lookup("alloc_end").is_some();
+            let alloc_ptr_found = lookup("alloc_ptr").is_some();
             // bump 区与 libc malloc 堆分离：alloc 区终点 = bump 区末尾
             memory.write(
                 alloc_end_addr,
                 &(bump_region_base + bump_region_size).to_le_bytes(),
             )?;
             memory.write(alloc_ptr_addr, &bump_region_base.to_le_bytes())?;
-            // glibc 2.35 在 __rtld_malloc_init_stubs 被调用前，早期路径已经
-            // 可能通过 __rtld_malloc 分配 link_map。按 ld.so 自身符号布局预置
-            // 三个最小分配器入口，避免空函数指针把控制流跳到 RIP=0。
-            let rtld_malloc_addr = bias + 0x39a60;
-            let rtld_free_addr = bias + 0x39a68;
-            let rtld_realloc_addr = bias + 0x39a58;
-            memory.write(rtld_malloc_addr, &(bias + 0xd3d0).to_le_bytes())?;
-            memory.write(rtld_free_addr, &(bias + 0xd530).to_le_bytes())?;
-            memory.write(rtld_realloc_addr, &(bias + 0xd570).to_le_bytes())?;
+            // glibc 在 __rtld_malloc_init_stubs 被调用前，早期路径可能已经
+            // 通过 __rtld_malloc 分配 link_map。若符号表能给出精确偏移则预置
+            // minimal 分配器入口，避免空函数指针把控制流跳到 RIP=0；无法解析
+            // 时跳过（stub 自举完成后会自行设置，预置仅覆盖早期窗口）。
+            if let Some((var, func)) = lookup("__rtld_malloc").zip(minimal_malloc) {
+                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+            }
+            if let Some((var, func)) = lookup("__rtld_free").zip(minimal_free) {
+                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+            }
+            if let Some((var, func)) = lookup("__rtld_realloc").zip(minimal_realloc) {
+                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+            }
+            if let Some((var, func)) = lookup("__rtld_calloc").zip(minimal_calloc) {
+                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+            }
             if std::env::var_os("DAOTI_TRACE_DLMAIN").is_some() {
                 eprintln!(
-                    "TRACE init-ldso-alloc alloc_ptr=0x{alloc_ptr_addr:x}<-0x{heap_addr:x} alloc_end=0x{alloc_end_addr:x}<-0x{heap_end:x} rtld_malloc=0x{rtld_malloc_addr:x}->0x{:x}",
-                    bias + 0xd3d0
+                    "TRACE init-ldso-alloc bias=0x{bias:x} alloc_ptr=0x{alloc_ptr_addr:x}(symtab={alloc_ptr_found})<-0x{bump_region_base:x} alloc_end=0x{alloc_end_addr:x}(symtab={alloc_end_found})<-0x{:x} minimal_malloc=0x{:x} minimal_free=0x{:x} minimal_realloc=0x{:x} minimal_calloc=0x{:x}",
+                    bump_region_base + bump_region_size,
+                    minimal_malloc.map(|o| bias + o).unwrap_or(0),
+                    minimal_free.map(|o| bias + o).unwrap_or(0),
+                    minimal_realloc.map(|o| bias + o).unwrap_or(0),
+                    minimal_calloc.map(|o| bias + o).unwrap_or(0),
                 );
             }
         }
