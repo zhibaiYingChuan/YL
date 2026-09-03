@@ -110,7 +110,14 @@ mod tests {
     use super::*;
 
     fn test_elf_path() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("daoti-engine-{}.elf", std::process::id()));
+        // 使用进程内唯一序号，避免多个测试并行时共享同一临时文件路径：
+        // 若两个测试同时 std::fs::write 截断同一文件，另一测试可能读到 <16 字节，
+        // 被 parse_binary 报"文件过短，无法识别格式"（macOS runner 已真实复现）。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("daoti-engine-{}-{unique}.elf", std::process::id()));
         let mut data = vec![0u8; 0x1000];
         data[0..4].copy_from_slice(b"\x7fELF");
         data[4] = 2;
