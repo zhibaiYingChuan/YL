@@ -2484,8 +2484,8 @@ impl<'a> X86_64Interpreter<'a> {
                         if let Ok(jb) = self.context.memory.read(jt_base, 39 * 4) {
                             let mut line =
                                 format!("TRACE reloc-bad-type jumptable_guest base=0x{jt_base:x}:");
-                            for (i, chunk) in jb.chunks_exact(4).enumerate() {
-                                let disp = i32::from_le_bytes(chunk.try_into().unwrap());
+                            for (i, chunk) in jb.as_chunks::<4>().0.iter().enumerate() {
+                                let disp = i32::from_le_bytes(*chunk);
                                 let target = (jt_base as i64 + disp as i64) as u64;
                                 line.push_str(&format!(
                                     " [{}]=0x{:x}->0x{:x}",

@@ -1308,7 +1308,10 @@ pub fn plan_dynamic_load(data: &[u8], preferred_base: u64) -> Result<DynamicLoad
         })
         .collect::<Result<Vec<_>, DaotiError>>()?;
     let mut entries = Vec::new();
-    for bytes in data[offset as usize..(offset + size) as usize].chunks_exact(16) {
+    for bytes in data[offset as usize..(offset + size) as usize]
+        .as_chunks::<16>()
+        .0
+    {
         let tag = i64::from_le_bytes(bytes[..8].try_into().unwrap());
         let value = u64::from_le_bytes(bytes[8..].try_into().unwrap());
         entries.push(ElfDynamicEntry { tag, value });

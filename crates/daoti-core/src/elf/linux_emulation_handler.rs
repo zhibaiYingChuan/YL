@@ -215,8 +215,10 @@ impl LinuxEmulationHandler {
                         .collect::<Vec<_>>()
                         .join(" ");
                     let stack_words = rsp_bytes
-                        .chunks_exact(8)
-                        .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|word| u64::from_le_bytes(*word))
                         .collect::<Vec<_>>();
                     eprintln!(
                         "TRACE inconsistency-rsp-top64 stack=0x{:x} bytes=[{}]",
@@ -259,8 +261,10 @@ impl LinuxEmulationHandler {
             match memory.read(addr, 64) {
                 Ok(bytes) => {
                     let words = bytes
-                        .chunks_exact(8)
-                        .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|word| u64::from_le_bytes(*word))
                         .collect::<Vec<_>>();
                     eprintln!(
                         "TRACE inconsistency-search-region addr=0x{addr:x} values={:?}",
