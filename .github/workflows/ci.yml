@@ -16,20 +16,12 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: static-hello-elf
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-
-      - name: 下载 gcc/glibc 静态 hello_libc.elf（Windows 验收资产）
-        if: runner.os == 'Windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: hello-libc-elf
-          path: ${{ github.workspace }}
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -80,12 +72,12 @@ jobs:
           cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
           if ($LASTEXITCODE -ne 0) { throw 'glibc 道体权重生成失败' }
           if (-not (Test-Path -LiteralPath knowledge/glibc_network.daotiblt)) { throw 'glibc 道体权重文件不存在' }
-      - name: 校验静态 hello_libc.elf（ET_EXEC 且无 PT_DYNAMIC/PT_INTERP）
+      - name: 校验静态 hello_libc.elf（受控 fixture：ET_EXEC 且无 PT_DYNAMIC/PT_INTERP）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path -LiteralPath hello_libc.elf)) { throw 'hello_libc.elf 不存在（static-hello-elf job 应已上传）' }
+          if (-not (Test-Path -LiteralPath hello_libc.elf)) { throw 'hello_libc.elf 不存在（静态 smoke 受控 fixture，源码 hello_libc.c）' }
           # 64 位小端 ELF：e_type 位于 0x10，PH 表偏移 0x20，phentsize 0x36，phnum 0x38。
           $elfBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath hello_libc.elf))
           $eType = [System.BitConverter]::ToUInt16($elfBytes, 0x10)
@@ -236,22 +228,6 @@ jobs:
 
       - name: Clippy 静态检查（拒绝所有警告）
         run: cargo clippy --workspace -- -D warnings
-
-  # 真实 gcc/glibc 静态 ELF 资产（供 Windows 静态 smoke 真实验收）：
-  # Zig 生成的静态 ELF 携带 PT_DYNAMIC 或使用 musl crt，与解释器支持范围不符；
-  # 改为在 Ubuntu 镜像上用真实 gcc -static 构建与本地验证同族的 glibc 静态可执行文件。
-  static-hello-elf:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: gcc -static 构建 hello_libc.elf
-        run: gcc -static -O0 -o hello_libc.elf hello_libc.c
-      - name: 上传静态 ELF 资产
-        uses: actions/upload-artifact@v4
-        with:
-          name: hello-libc-elf
-          path: hello_libc.elf
-          if-no-files-found: error
 
   # 三平台验收门禁：每个平台都必须通过真实构建/测试，不将 mock 当作能力证明
   acceptance:
