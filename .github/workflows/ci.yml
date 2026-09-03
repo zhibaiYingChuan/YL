@@ -76,9 +76,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          zig cc -target x86_64-linux-musl -static -O0 -o hello_libc.elf hello_libc.c
+          # 强制非 PIE（ET_EXEC）：Zig 默认产出静态 PIE（ET_DYN），会导致 CLI 误判为动态 ELF。
+          zig cc -target x86_64-linux-musl -static -no-pie -fno-pie -O0 -o hello_libc.elf hello_libc.c
           if ($LASTEXITCODE -ne 0) { throw 'zig cc 编译 hello_libc.elf 失败' }
           if (-not (Test-Path -LiteralPath hello_libc.elf)) { throw 'Zig 未产出 hello_libc.elf' }
+          # 打印 ELF 头 e_type：2=ET_EXEC，3=ET_DYN；用于证明该文件被正确识别为静态 ELF。
+          $elfBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath hello_libc.elf))
+          $eType = [System.BitConverter]::ToUInt16($elfBytes, 0x10)
+          Write-Output ("hello_libc.elf e_type=0x{0:X4} (2=EXEC 3=DYN)" -f $eType)
+          if ($eType -ne 2) { throw ('hello_libc.elf 未生成 ET_EXEC，实际 e_type=0x{0:X4}' -f $eType) }
       - name: 生成真实 TLS 动态 ELF fixture（Linux 工具链）
         if: runner.os == 'Linux'
         shell: bash
