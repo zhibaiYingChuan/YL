@@ -143,6 +143,10 @@ jobs:
       - name: 生成 Mach-O runtime fixture
         shell: pwsh
         run: python scripts/build-macho-console-fixture.py target/macho_console_fixture
+      - name: 生成 macOS arm64 runtime fixture（HTTP 原生执行）
+        if: runner.os == 'macOS'
+        shell: pwsh
+        run: python scripts/build-macho-console-fixture.py target/macho_console_fixture_arm64 arm64
       - name: 验收 Mach-O runtime 真实解释执行
         shell: pwsh
         run: cargo test -p daoti-core macho_runtime::tests::executes_real_macho_console_fixture --lib
@@ -180,7 +184,7 @@ jobs:
           python3 - <<'PY'
           import base64, json
           from pathlib import Path
-          binary = Path('target/macho_console_fixture').read_bytes()
+          binary = Path('target/macho_console_fixture_arm64').read_bytes()
           request = {
               'request_id': 'ci-real-macos-http',
               'filename': 'macho_console_fixture',
