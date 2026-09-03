@@ -76,8 +76,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # 强制非 PIE（ET_EXEC）：Zig 默认产出静态 PIE（ET_DYN），会导致 CLI 误判为动态 ELF。
-          zig cc -target x86_64-linux-musl -static -no-pie -fno-pie -O0 -o hello_libc.elf hello_libc.c
+          # 强制非 PIE（ET_EXEC）且使用 glibc：Zig musl 静态 crt 与解释器假设不符（本地验证为 gcc/glibc 静态可执行）。
+          zig cc -target x86_64-linux-gnu -static -no-pie -fno-pie -O0 -o hello_libc.elf hello_libc.c
           if ($LASTEXITCODE -ne 0) { throw 'zig cc 编译 hello_libc.elf 失败' }
           if (-not (Test-Path -LiteralPath hello_libc.elf)) { throw 'Zig 未产出 hello_libc.elf' }
           # 打印 ELF 头 e_type：2=ET_EXEC，3=ET_DYN；用于证明该文件被正确识别为静态 ELF。
