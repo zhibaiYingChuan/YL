@@ -111,7 +111,7 @@ mod tests {
 
     fn test_elf_path() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("daoti-engine-{}.elf", std::process::id()));
-        let mut data = vec![0u8; 120];
+        let mut data = vec![0u8; 0x1000];
         data[0..4].copy_from_slice(b"\x7fELF");
         data[4] = 2;
         data[5] = 1;

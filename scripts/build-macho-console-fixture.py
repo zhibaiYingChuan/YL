@@ -70,7 +70,7 @@ def build_arm64():
     code = b"".join(
         [
             arm64_movz(0, 1),
-            arm64_adr(1, 36),
+            arm64_adr(1, 40),
             arm64_movz(2, len(message)),
             arm64_movz(16, 4),
             arm64_movk(16, 0x200, 16),

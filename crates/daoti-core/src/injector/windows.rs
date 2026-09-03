@@ -142,9 +142,9 @@ impl Injector for WindowsInjector {
         #[cfg(not(target_os = "windows"))]
         {
             let _ = target;
-            return Err(DaotiError::Unavailable(
+            Err(DaotiError::Unavailable(
                 "Windows 注入器仅支持 Windows 平台".into(),
-            ));
+            ))
         }
 
         // Windows 平台实现
