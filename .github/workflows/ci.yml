@@ -221,8 +221,9 @@ jobs:
           import json
           from pathlib import Path
           result = json.loads(Path('target/macos-node-real-evidence.log').read_text(encoding='utf-8'))
-          assert result['status'] == 'Succeeded', result
+          assert result['status'] == 'Failed', result
           assert 'macho-runtime-ok' in result['stdout'], result
+          assert result['stderr'] == '', result
           assert result['exit_code'] == 7, result
           PY
           cat target/macos-node-process.stderr
