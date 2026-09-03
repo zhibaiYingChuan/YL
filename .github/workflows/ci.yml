@@ -112,6 +112,21 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/build-glibc-hello-fixture.sh target/hello_glibc
+      - name: 真实 glibc hello 契约取证（北极星任务 2，允许失败保留证据）
+        if: runner.os == 'Linux'
+        shell: bash
+        continue-on-error: true
+        env:
+          DAOTI_TRACE_RUNTIME: '1'
+          DAOTI_TRACE_DLMAIN: '1'
+          DAOTI_TRACE_LINK_MAP_INFO_SCAN: '1'
+          DAOTI_TRACE_NS_LOADED_WRITE: '1'
+        run: |
+          set +e
+          cargo test -p daoti-core --lib load_and_run_real_glibc_hello_uses_stdout_and_exit_zero -- --ignored --nocapture > target/glibc-hello-contract.log 2>&1
+          printf 'contract_exit=%s\n' "$?" >> target/glibc-hello-contract.log
+          cat target/glibc-hello-contract.log
+          set -e
       - name: 上传真实 glibc hello fixture 证据
         if: runner.os == 'Linux' && always()
         uses: actions/upload-artifact@v4
@@ -120,6 +135,7 @@ jobs:
           path: |
             target/hello_glibc
             target/hello_glibc_manifest.txt
+            target/glibc-hello-contract.log
           if-no-files-found: ignore
 
       - name: Windows CLI 验收真实动态 ELF fixture
