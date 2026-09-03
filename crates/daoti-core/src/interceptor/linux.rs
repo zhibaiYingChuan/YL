@@ -259,6 +259,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_ptrace_next_event_on_non_linux_returns_none() {
         let mut source = PtraceCaptureSource::new_internal(0, PtraceArch::X86_64);

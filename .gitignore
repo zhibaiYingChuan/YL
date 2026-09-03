@@ -33,3 +33,34 @@ crates/daoti-ui/binaries/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 本地研发过程资料与实验数据
+/debug-*.md
+/debug-*.log
+/shadow*.jsonl
+/shadow-batches/
+/knowledge/
+/fixtures/datasets/
+
+# 本地研发过程文档（线上不提交）
+/docs/开发计划*.md
+/docs/推进计划*.md
+/docs/*施工计划*.md
+/docs/*训练*.md
+/docs/*知识学习*.md
+/docs/*改造方案*.md
+/docs/*双梯形*.md
+
+# 本地实验脚本与二进制产物
+/_*.py
+/ctype_*.py
+/diagnose_*.rs
+/disasm_*.py
+/dump-*.py
+/fetch-*.py
+/trigram_*.py
+/hello_*
+/rtld-*.c
+/*.elf
+/*.o
+/*.S

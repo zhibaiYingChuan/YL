@@ -97,8 +97,10 @@ def build(architecture):
         raise ValueError(f"不支持的 Mach-O 架构：{architecture}")
 
     commands_size = 72 + 24
+    # mach_header_64: magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved
+    # filetype=2 (MH_EXECUTE)，ncmds=2（LC_SEGMENT_64 + LC_MAIN）
     header = struct.pack(
-        "<8I", 0xFEEDFACF, cputype, cpusubtype, 3, 2, commands_size, 0, 0
+        "<8I", 0xFEEDFACF, cputype, cpusubtype, 2, 2, commands_size, 0, 0
     )
     segment = (
         u32(0x19)
