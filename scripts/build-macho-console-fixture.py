@@ -70,7 +70,7 @@ def build_arm64():
     code = b"".join(
         [
             arm64_movz(0, 1),
-            arm64_adr(1, 40),
+            arm64_adr(1, 36),
             arm64_movz(2, len(message)),
             arm64_movz(16, 4),
             arm64_movk(16, 0x200, 16),
@@ -96,11 +96,14 @@ def build(architecture):
     else:
         raise ValueError(f"不支持的 Mach-O 架构：{architecture}")
 
-    commands_size = 72 + 24
+    dyld_path = b"/usr/lib/dyld\0"
+    dyld = u32(0x0E) + u32(32) + u32(12) + dyld_path
+    dyld += b"\0" * (32 - len(dyld))
+    commands_size = 72 + len(dyld) + 24
     # mach_header_64: magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved
-    # filetype=2 (MH_EXECUTE)，ncmds=2（LC_SEGMENT_64 + LC_MAIN）
+    # filetype=2 (MH_EXECUTE)，ncmds=3（LC_SEGMENT_64 + LC_LOAD_DYLINKER + LC_MAIN）
     header = struct.pack(
-        "<8I", 0xFEEDFACF, cputype, cpusubtype, 2, 2, commands_size, 0, 0
+        "<8I", 0xFEEDFACF, cputype, cpusubtype, 2, 3, commands_size, 0, 0
     )
     segment = (
         u32(0x19)
@@ -116,7 +119,7 @@ def build(architecture):
         + u32(0)
     )
     main = u32(0x80000028) + u32(24) + u64(entryoff) + u64(0)
-    image = bytearray(header + segment + main)
+    image = bytearray(header + segment + dyld + main)
     image.extend(b"\0" * (fileoff - len(image)))
     image.extend(code)
     image.extend(message)

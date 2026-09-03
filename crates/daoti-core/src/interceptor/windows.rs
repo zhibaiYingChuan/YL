@@ -217,34 +217,34 @@ impl SyscallCaptureSource for DebugCaptureSource {
         }
 
         if !self.running {
-            return Ok(None);
-        }
+            Ok(None)
+        } else {
+            // 非 Windows 平台：返回 None
+            #[cfg(not(target_os = "windows"))]
+            {
+                self.running = false;
+                Ok(None)
+            }
 
-        // 非 Windows 平台：返回 None
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.running = false;
-            return Ok(None);
-        }
+            // Windows 平台：等待调试事件并转换
+            #[cfg(target_os = "windows")]
+            {
+                let debug_event = self.wait_for_debug_event()?;
 
-        // Windows 平台：等待调试事件并转换
-        #[cfg(target_os = "windows")]
-        {
-            let debug_event = self.wait_for_debug_event()?;
-
-            match debug_event.kind {
-                DebugEventKind::ExitProcess => {
-                    self.running = false;
-                    Ok(None)
-                }
-                DebugEventKind::Exception => {
-                    let syscall = Self::debug_event_to_syscall(&debug_event);
-                    Ok(syscall)
-                }
-                _ => {
-                    // 其他事件（线程创建/DLL 加载等）跳过
-                    // 递归调用继续等待下一个事件
-                    self.next_event()
+                match debug_event.kind {
+                    DebugEventKind::ExitProcess => {
+                        self.running = false;
+                        Ok(None)
+                    }
+                    DebugEventKind::Exception => {
+                        let syscall = Self::debug_event_to_syscall(&debug_event);
+                        Ok(syscall)
+                    }
+                    _ => {
+                        // 其他事件（线程创建/DLL 加载等）跳过
+                        // 递归调用继续等待下一个事件
+                        self.next_event()
+                    }
                 }
             }
         }

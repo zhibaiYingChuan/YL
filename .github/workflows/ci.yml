@@ -196,14 +196,18 @@ jobs:
           Path('target/macos-node-execute-request.json').write_text(json.dumps(request), encoding='utf-8')
           PY
           set +e
-          curl --silent --show-error --max-time 10 \
+          execute_http_code=$(curl --silent --show-error --max-time 10 \
             -H "X-Daoti-Token: $DAOTI_MACOS_NODE_TOKEN" \
             -H 'Content-Type: application/json' \
             --data-binary @target/macos-node-execute-request.json \
-            http://127.0.0.1:18767/execute | tee target/macos-node-real-evidence.log
-          execute_http_code=${PIPESTATUS[0]}
+            --output target/macos-node-real-evidence.log \
+            --write-out '%{http_code}' \
+            http://127.0.0.1:18767/execute)
+          curl_exit_code=$?
           set -e
-          test "$execute_http_code" -eq 0 || { cat target/macos-node-process.stderr; exit "$execute_http_code"; }
+          cat target/macos-node-real-evidence.log
+          test "$curl_exit_code" -eq 0 || { cat target/macos-node-process.stderr; exit "$curl_exit_code"; }
+          test "$execute_http_code" -eq 200 || { cat target/macos-node-process.stderr; exit 1; }
           python3 - <<'PY'
           import json
           from pathlib import Path
