@@ -3028,7 +3028,10 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/runtime/hello_minimal_dynamic.elf");
         if !root.exists() {
-            eprintln!("ignored: hello_minimal_dynamic.elf fixture 不存在：{}", root.display());
+            eprintln!(
+                "ignored: hello_minimal_dynamic.elf fixture 不存在：{}",
+                root.display()
+            );
             return;
         }
         let runtime_root = root.parent().expect("fixture 必须有父目录").to_path_buf();
@@ -3715,6 +3718,53 @@ mod tests {
             }
             assert!(found, "auxv 应包含 AT_ENTRY=0x{entry:x}");
         });
+    }
+
+    /// 北极星任务 1：真实 glibc hello 端到端执行契约。
+    ///
+    /// 前置：先在 Linux runner 生成真实 glibc 动态 ELF fixture：
+    /// `bash scripts/build-glibc-hello-fixture.sh target/hello_glibc`（ET_DYN +
+    /// PT_INTERP + DT_NEEDED=libc.so.6，均经 readelf 契约断言）。
+    /// 期望：真实输出 `Hello from libc!`、退出码 0、审计含 write。
+    ///
+    /// 当前真实状态：glibc 运行时数据结构（_rtld_global / link_map / TLS /
+    /// _r_debug）尚未完整初始化，本契约在未完成前会以真实错误失败——
+    /// 不得将解析或 mock 结果宣称为 glibc 执行闭环（北极星硬约束：不假绿）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "北极星任务1验收门禁：真实 glibc 初始化未完成；未生成 target/hello_glibc 前禁止假绿"]
+    fn load_and_run_real_glibc_hello_uses_stdout_and_exit_zero() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/hello_glibc");
+        assert!(
+            root.is_file(),
+            "真实 glibc hello 主对象不存在：{}（需先运行 scripts/build-glibc-hello-fixture.sh）",
+            root.display()
+        );
+        let runtime_root = root.parent().expect("fixture 必须有父目录").to_path_buf();
+        let loader = DynamicElfLoader::new(EmptyDynamicResolver, 0x700000, 0x20_000)
+            .expect("动态 ELF 加载器应创建");
+        let audit = AuditBuffer::new();
+        let result = loader
+            .load_and_run(&root, std::slice::from_ref(&runtime_root), audit)
+            .expect("真实 glibc hello 应由本地解释器执行完成（如失败即真实 glibc 缺口证据）");
+
+        assert_eq!(result.mode, "native_interpreter");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            stdout.contains("Hello from libc!"),
+            "stdout={stdout:?} audit={:?} state={:?}",
+            result.audit.records(),
+            result.state
+        );
+        assert!(result
+            .audit
+            .records()
+            .iter()
+            .any(|record| record.starts_with("write:")));
+        assert_eq!(
+            result.state,
+            super::super::runtime::ExecutionState::Exited(0)
+        );
     }
 
     /// 真实动态 libc 门禁测试。

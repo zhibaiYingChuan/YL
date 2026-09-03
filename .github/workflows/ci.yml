@@ -108,6 +108,19 @@ jobs:
           DAOTI_TRACE_TLS: '1'
         run: |
           cargo test -p daoti-core --lib load_and_run_real_tls_dynamic_chain -- --ignored --nocapture
+      - name: 生成真实 glibc hello fixture（北极星任务 1 契约）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/build-glibc-hello-fixture.sh target/hello_glibc
+      - name: 上传真实 glibc hello fixture 证据
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-glibc-hello-fixture-evidence
+          path: |
+            target/hello_glibc
+            target/hello_glibc_manifest.txt
+          if-no-files-found: ignore
 
       - name: Windows CLI 验收真实动态 ELF fixture
         if: runner.os == 'Windows'
