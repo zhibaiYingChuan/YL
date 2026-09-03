@@ -5,22 +5,34 @@ use ndarray::{Array1, Array2};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// 解析道体权重路径：env var 指定的路径若存在则优先，否则回退候选列表。
+///
+/// 旧实现只要设置了 `DAOTI_B2_WEIGHTS_PATH` 就无条件使用（不校验 is_file），
+/// 相对路径在测试 CWD 下解析失败会直接报 `ModelMissing`，掩盖真实 glibc 缺口。
+fn resolve_daoti_weights_path() -> Option<PathBuf> {
+    if let Some(env_path) = std::env::var_os("DAOTI_B2_WEIGHTS_PATH") {
+        let path = PathBuf::from(env_path);
+        if path.is_file() {
+            return Some(path);
+        }
+        eprintln!(
+            "TRACE weights env var 指向不存在文件，回退候选列表: {}",
+            path.display()
+        );
+    }
+    [
+        PathBuf::from("knowledge/glibc_network.daotiblt"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../knowledge/glibc_network.daotiblt"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
 fn load_glibc_daoti_network(
 ) -> Result<crate::bilateral::network::BilateralLadderNetwork, DaotiError> {
-    let path = std::env::var_os("DAOTI_B2_WEIGHTS_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            [
-                PathBuf::from("knowledge/glibc_network.daotiblt"),
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../knowledge/glibc_network.daotiblt"),
-            ]
-            .into_iter()
-            .find(|candidate| candidate.is_file())
-        })
-        .ok_or_else(|| {
-            DaotiError::InferenceFailed("未加载道体权重，动态 ELF 阶段决策无法继续".into())
-        })?;
+    let path = resolve_daoti_weights_path().ok_or_else(|| {
+        DaotiError::InferenceFailed("未加载道体权重，动态 ELF 阶段决策无法继续".into())
+    })?;
     let weights = crate::bilateral::weights::WeightsLoader::load(&path)?;
     let ascent = Array2::from_shape_vec((weights.dim, weights.dim), weights.ascent)
         .map_err(|error| DaotiError::ModelCorrupt(format!("上梯形权重维度错误：{error}")))?;
@@ -1999,6 +2011,21 @@ where
         // 只有符号表能给出稳定可验证的目标地址。
         if let Some(interp) = &interpreter {
             let bias = interp.plan.load_bias;
+            // 归属校验：计算 ld.so 自身 PT_LOAD 的运行时数据/BSS 范围。
+            // 只有落在该范围内的地址才允许预置写入——若 2.39 布局漂移使
+            // 回退地址落入 libc 等其他对象的内存，写入会污染其堆元数据并触发
+            // "malloc(): corrupted top size"。范围外一律跳过预置，依赖 glibc
+            // 自初始化（alloc_end==0 → alloc_ptr=&_end 页内 bump + __mmap 扩容）。
+            let (ldso_min, ldso_max) = interp.plan.load_segments.iter().fold(
+                (u64::MAX, 0u64),
+                |(min_end, max_end), segment| {
+                    (
+                        min_end.min(segment.mapped_start),
+                        max_end.max(segment.mapped_end),
+                    )
+                },
+            );
+            let owns = |addr: u64| addr >= ldso_min && addr < ldso_max;
             let syms = super::read_full_symtab_symbols(&interp.bytes).unwrap_or_default();
             let lookup = |name: &str| {
                 syms.iter()
@@ -2019,31 +2046,50 @@ where
                 .unwrap_or(bias + 0x34188);
             let alloc_end_found = lookup("alloc_end").is_some();
             let alloc_ptr_found = lookup("alloc_ptr").is_some();
-            // bump 区与 libc malloc 堆分离：alloc 区终点 = bump 区末尾
-            memory.write(
-                alloc_end_addr,
-                &(bump_region_base + bump_region_size).to_le_bytes(),
-            )?;
-            memory.write(alloc_ptr_addr, &bump_region_base.to_le_bytes())?;
+            // bump 区与 libc malloc 堆分离：alloc 区终点 = bump 区末尾。
+            // 归属校验失败时跳过写入（glibc 自初始化兜底），避免漂移写坏内存。
+            if owns(alloc_end_addr) {
+                memory.write(
+                    alloc_end_addr,
+                    &(bump_region_base + bump_region_size).to_le_bytes(),
+                )?;
+            }
+            if owns(alloc_ptr_addr) {
+                memory.write(alloc_ptr_addr, &bump_region_base.to_le_bytes())?;
+            }
             // glibc 在 __rtld_malloc_init_stubs 被调用前，早期路径可能已经
             // 通过 __rtld_malloc 分配 link_map。若符号表能给出精确偏移则预置
             // minimal 分配器入口，避免空函数指针把控制流跳到 RIP=0；无法解析
-            // 时跳过（stub 自举完成后会自行设置，预置仅覆盖早期窗口）。
+            // 或越界时跳过（stub 自举完成后会自行设置，预置仅覆盖早期窗口）。
             if let Some((var, func)) = lookup("__rtld_malloc").zip(minimal_malloc) {
-                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+                let target = bias + var;
+                if owns(target) {
+                    memory.write(target, &(bias + func).to_le_bytes())?;
+                }
             }
             if let Some((var, func)) = lookup("__rtld_free").zip(minimal_free) {
-                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+                let target = bias + var;
+                if owns(target) {
+                    memory.write(target, &(bias + func).to_le_bytes())?;
+                }
             }
             if let Some((var, func)) = lookup("__rtld_realloc").zip(minimal_realloc) {
-                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+                let target = bias + var;
+                if owns(target) {
+                    memory.write(target, &(bias + func).to_le_bytes())?;
+                }
             }
             if let Some((var, func)) = lookup("__rtld_calloc").zip(minimal_calloc) {
-                memory.write(bias + var, &(bias + func).to_le_bytes())?;
+                let target = bias + var;
+                if owns(target) {
+                    memory.write(target, &(bias + func).to_le_bytes())?;
+                }
             }
             if std::env::var_os("DAOTI_TRACE_DLMAIN").is_some() {
                 eprintln!(
-                    "TRACE init-ldso-alloc bias=0x{bias:x} alloc_ptr=0x{alloc_ptr_addr:x}(symtab={alloc_ptr_found})<-0x{bump_region_base:x} alloc_end=0x{alloc_end_addr:x}(symtab={alloc_end_found})<-0x{:x} minimal_malloc=0x{:x} minimal_free=0x{:x} minimal_realloc=0x{:x} minimal_calloc=0x{:x}",
+                    "TRACE init-ldso-alloc bias=0x{bias:x} ldso=[0x{ldso_min:x},0x{ldso_max:x}) alloc_ptr=0x{alloc_ptr_addr:x}(symtab={alloc_ptr_found},in_range={})<-0x{bump_region_base:x} alloc_end=0x{alloc_end_addr:x}(symtab={alloc_end_found},in_range={})<-0x{:x} minimal_malloc=0x{:x} minimal_free=0x{:x} minimal_realloc=0x{:x} minimal_calloc=0x{:x}",
+                    owns(alloc_ptr_addr),
+                    owns(alloc_end_addr),
                     bump_region_base + bump_region_size,
                     minimal_malloc.map(|o| bias + o).unwrap_or(0),
                     minimal_free.map(|o| bias + o).unwrap_or(0),
@@ -2562,17 +2608,7 @@ where
             decision_sample.input_vector[index] = 1.0;
             decision_sample.output_vector[index] = 1.0;
         }
-        let model_path = std::env::var_os("DAOTI_B2_WEIGHTS_PATH")
-            .map(PathBuf::from)
-            .or_else(|| {
-                [
-                    PathBuf::from("knowledge/glibc_network.daotiblt"),
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../knowledge/glibc_network.daotiblt"),
-                ]
-                .into_iter()
-                .find(|path| path.is_file())
-            });
+        let model_path = resolve_daoti_weights_path();
         let candidate = model_path
             .map(|path| {
                 let weights = crate::bilateral::weights::WeightsLoader::load(&path)?;

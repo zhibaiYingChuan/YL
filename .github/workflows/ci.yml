@@ -112,6 +112,12 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/build-glibc-hello-fixture.sh target/hello_glibc
+      - name: 离线生成 glibc 道体权重（/knowledge/ 被 gitignore，CI 无权重文件）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
+          ls -la knowledge/glibc_network.daotiblt
       - name: 真实 glibc hello 契约取证（北极星任务 2，允许失败保留证据）
         if: runner.os == 'Linux'
         shell: bash
