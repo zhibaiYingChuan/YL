@@ -16,12 +16,20 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: static-hello-elf
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+
+      - name: 下载 gcc/glibc 静态 hello_libc.elf（Windows 验收资产）
+        if: runner.os == 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: hello-libc-elf
+          path: ${{ github.workspace }}
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -72,19 +80,31 @@ jobs:
           cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
           if ($LASTEXITCODE -ne 0) { throw 'glibc 道体权重生成失败' }
           if (-not (Test-Path -LiteralPath knowledge/glibc_network.daotiblt)) { throw 'glibc 道体权重文件不存在' }
-      - name: 生成真实静态 glibc/musl ELF（Windows，Zig 交叉工具链）
+      - name: 校验静态 hello_libc.elf（ET_EXEC 且无 PT_DYNAMIC/PT_INTERP）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # 强制非 PIE（ET_EXEC）且使用 glibc：Zig musl 静态 crt 与解释器假设不符（本地验证为 gcc/glibc 静态可执行）。
-          zig cc -target x86_64-linux-gnu -static -no-pie -fno-pie -O0 -o hello_libc.elf hello_libc.c
-          if ($LASTEXITCODE -ne 0) { throw 'zig cc 编译 hello_libc.elf 失败' }
-          if (-not (Test-Path -LiteralPath hello_libc.elf)) { throw 'Zig 未产出 hello_libc.elf' }
-          # 打印 ELF 头 e_type：2=ET_EXEC，3=ET_DYN；用于证明该文件被正确识别为静态 ELF。
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath hello_libc.elf)) { throw 'hello_libc.elf 不存在（static-hello-elf job 应已上传）' }
+          # 64 位小端 ELF：e_type 位于 0x10，PH 表偏移 0x20，phentsize 0x36，phnum 0x38。
           $elfBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath hello_libc.elf))
           $eType = [System.BitConverter]::ToUInt16($elfBytes, 0x10)
           Write-Output ("hello_libc.elf e_type=0x{0:X4} (2=EXEC 3=DYN)" -f $eType)
-          if ($eType -ne 2) { throw ('hello_libc.elf 未生成 ET_EXEC，实际 e_type=0x{0:X4}' -f $eType) }
+          if ($eType -ne 2) { throw ('hello_libc.elf 不是 ET_EXEC，实际 e_type=0x{0:X4}' -f $eType) }
+          $phoff = [System.BitConverter]::ToUInt64($elfBytes, 0x20)
+          $phentsize = [System.BitConverter]::ToUInt16($elfBytes, 0x36)
+          $phnum = [System.BitConverter]::ToUInt16($elfBytes, 0x38)
+          $dynamicHeaderTypes = @()
+          for ($i = 0; $i -lt $phnum; $i++) {
+            $off = [int]($phoff + $i * $phentsize)
+            $pType = [System.BitConverter]::ToUInt32($elfBytes, $off)
+            # 2=PT_DYNAMIC，3=PT_INTERP：任一存在都会被 CLI 判为动态 ELF
+            if ($pType -eq 2 -or $pType -eq 3) { $dynamicHeaderTypes += $pType }
+          }
+          if ($dynamicHeaderTypes.Count -gt 0) {
+            throw ('hello_libc.elf 含动态程序头 PT_DYNAMIC/PT_INTERP：{0}，会被 CLI 误判为动态 ELF' -f ($dynamicHeaderTypes -join ','))
+          }
+          Write-Output 'hello_libc.elf 程序头无 PT_DYNAMIC/PT_INTERP，将被识别为静态 ELF'
       - name: 生成真实 TLS 动态 ELF fixture（Linux 工具链）
         if: runner.os == 'Linux'
         shell: bash
@@ -216,6 +236,22 @@ jobs:
 
       - name: Clippy 静态检查（拒绝所有警告）
         run: cargo clippy --workspace -- -D warnings
+
+  # 真实 gcc/glibc 静态 ELF 资产（供 Windows 静态 smoke 真实验收）：
+  # Zig 生成的静态 ELF 携带 PT_DYNAMIC 或使用 musl crt，与解释器支持范围不符；
+  # 改为在 Ubuntu 镜像上用真实 gcc -static 构建与本地验证同族的 glibc 静态可执行文件。
+  static-hello-elf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: gcc -static 构建 hello_libc.elf
+        run: gcc -static -O0 -o hello_libc.elf hello_libc.c
+      - name: 上传静态 ELF 资产
+        uses: actions/upload-artifact@v4
+        with:
+          name: hello-libc-elf
+          path: hello_libc.elf
+          if-no-files-found: error
 
   # 三平台验收门禁：每个平台都必须通过真实构建/测试，不将 mock 当作能力证明
   acceptance:
