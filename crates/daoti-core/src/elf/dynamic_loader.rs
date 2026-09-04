@@ -2037,25 +2037,24 @@ where
             let minimal_free = lookup("__minimal_free");
             let minimal_realloc = lookup("__minimal_realloc");
             let minimal_calloc = lookup("__minimal_calloc");
-            // 目标变量地址；符号表缺失时回退 2.35 时代硬编码（并留 TRACE 告警）。
-            let alloc_end_addr = lookup("alloc_end")
-                .map(|offset| bias + offset)
-                .unwrap_or(bias + 0x34180);
-            let alloc_ptr_addr = lookup("alloc_ptr")
-                .map(|offset| bias + offset)
-                .unwrap_or(bias + 0x34188);
-            let alloc_end_found = lookup("alloc_end").is_some();
-            let alloc_ptr_found = lookup("alloc_ptr").is_some();
+            // 目标变量地址：仅当符号表能给出精确偏移时才预置。
+            // 取证结论（2026-09-04）：2.35/2.39 发行版 ld-linux 均无 .symtab，
+            // 历史硬编码 0x34180/0x34188 在 2.35 中落在 .eh_frame 且无任何指令
+            // 引用（预置从未生效，靠 glibc 自初始化通过），在 2.39 中则会污染
+            // 可执行程序段并触发 main_map != NULL 断言。因此符号解析不到时
+            // 一律跳过预置，完全依赖 __minimal_malloc 自初始化（alloc_end==0
+            // → alloc_ptr=&_end 页内 bump，不足时 __mmap 扩容）。
+            let alloc_end_addr = lookup("alloc_end").map(|offset| bias + offset);
+            let alloc_ptr_addr = lookup("alloc_ptr").map(|offset| bias + offset);
+            let alloc_end_found = alloc_end_addr.is_some();
+            let alloc_ptr_found = alloc_ptr_addr.is_some();
             // bump 区与 libc malloc 堆分离：alloc 区终点 = bump 区末尾。
-            // 归属校验失败时跳过写入（glibc 自初始化兜底），避免漂移写坏内存。
-            if owns(alloc_end_addr) {
-                memory.write(
-                    alloc_end_addr,
-                    &(bump_region_base + bump_region_size).to_le_bytes(),
-                )?;
+            // 归属校验 + Option 双重保险：地址越界或不解析时跳过写入。
+            if let Some(addr) = alloc_end_addr.filter(|&a| owns(a)) {
+                memory.write(addr, &(bump_region_base + bump_region_size).to_le_bytes())?;
             }
-            if owns(alloc_ptr_addr) {
-                memory.write(alloc_ptr_addr, &bump_region_base.to_le_bytes())?;
+            if let Some(addr) = alloc_ptr_addr.filter(|&a| owns(a)) {
+                memory.write(addr, &bump_region_base.to_le_bytes())?;
             }
             // glibc 在 __rtld_malloc_init_stubs 被调用前，早期路径可能已经
             // 通过 __rtld_malloc 分配 link_map。若符号表能给出精确偏移则预置
@@ -2086,10 +2085,16 @@ where
                 }
             }
             if std::env::var_os("DAOTI_TRACE_DLMAIN").is_some() {
+                let alloc_ptr_info = alloc_ptr_addr
+                    .map(|a| format!("0x{a:x}"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let alloc_end_info = alloc_end_addr
+                    .map(|a| format!("0x{a:x}"))
+                    .unwrap_or_else(|| "n/a".to_string());
                 eprintln!(
-                    "TRACE init-ldso-alloc bias=0x{bias:x} ldso=[0x{ldso_min:x},0x{ldso_max:x}) alloc_ptr=0x{alloc_ptr_addr:x}(symtab={alloc_ptr_found},in_range={})<-0x{bump_region_base:x} alloc_end=0x{alloc_end_addr:x}(symtab={alloc_end_found},in_range={})<-0x{:x} minimal_malloc=0x{:x} minimal_free=0x{:x} minimal_realloc=0x{:x} minimal_calloc=0x{:x}",
-                    owns(alloc_ptr_addr),
-                    owns(alloc_end_addr),
+                    "TRACE init-ldso-alloc bias=0x{bias:x} ldso=[0x{ldso_min:x},0x{ldso_max:x}) alloc_ptr={alloc_ptr_info}(symtab={alloc_ptr_found},in_range={})<-0x{bump_region_base:x} alloc_end={alloc_end_info}(symtab={alloc_end_found},in_range={})<-0x{:x} minimal_malloc=0x{:x} minimal_free=0x{:x} minimal_realloc=0x{:x} minimal_calloc=0x{:x}",
+                    alloc_ptr_addr.map_or(false, owns),
+                    alloc_end_addr.map_or(false, owns),
                     bump_region_base + bump_region_size,
                     minimal_malloc.map(|o| bias + o).unwrap_or(0),
                     minimal_free.map(|o| bias + o).unwrap_or(0),
