@@ -487,6 +487,11 @@ impl LinuxEmulationHandler {
             137 => "statfs",
             138 => "fstatfs",
             263 => "unlinkat",
+            79 => "getcwd",
+            80 => "chdir",
+            74 => "fsync",
+            77 => "ftruncate",
+            258 => "mkdirat",
             3 => "close",
             0 => "read",
             20 => "writev",
@@ -783,6 +788,11 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 137
                 | 138
                 | 263
+                | 74
+                | 77
+                | 79
+                | 80
+                | 258
                 | 12
                 | 13
                 | 14

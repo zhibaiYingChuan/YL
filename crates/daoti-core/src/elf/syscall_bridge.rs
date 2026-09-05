@@ -20,6 +20,11 @@ pub const SYS_ACCESS: u64 = 21;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_UNLINKAT: u64 = 263;
+pub const SYS_GETCWD: u64 = 79;
+pub const SYS_CHDIR: u64 = 80;
+pub const SYS_FSYNC: u64 = 74;
+pub const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_MKDIRAT: u64 = 258;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_BRK: u64 = 12;
@@ -539,6 +544,7 @@ pub struct NativeSyscallBridge<S: OutputSink> {
     pointer_guard: u64,
     stack_guard: u64,
     allowed_roots: Vec<PathBuf>,
+    current_dir: PathBuf,
     files: HashMap<i32, (Vec<u8>, usize)>,
     next_fd: i32,
     /// 主程序 PT_LOAD 已映射区间 [(start,end)…]，用于关联 mmap 返回值。
@@ -586,6 +592,7 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             pointer_guard: 0,
             stack_guard: 0,
             allowed_roots: Vec::new(),
+            current_dir: PathBuf::new(),
             files: HashMap::new(),
             next_fd: 3,
             main_ptload_ranges: Vec::new(),
@@ -622,7 +629,15 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
     }
 
     fn resolve_guest_path(&self, path: &Path) -> Option<PathBuf> {
-        let relative = path.strip_prefix("/").unwrap_or(path);
+        // 相对路径基于当前目录（guest / 语义）解析，绝对路径以根开始。
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else if self.current_dir.as_os_str().is_empty() {
+            PathBuf::from("/").join(path)
+        } else {
+            self.current_dir.join(path)
+        };
+        let relative = joined.strip_prefix("/").unwrap_or(&joined);
         self.allowed_roots
             .iter()
             .flat_map(|root| {
@@ -631,6 +646,38 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 basename.into_iter().chain(std::iter::once(exact))
             })
             .find(|candidate| candidate.is_file())
+    }
+
+    /// 返回 guest 视角绝对路径下、受控根内的候选宿主路径列表（不校验存在性）。
+    fn resolve_sandbox_candidates(&self, path: &Path) -> Vec<PathBuf> {
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else if self.current_dir.as_os_str().is_empty() {
+            PathBuf::from("/").join(path)
+        } else {
+            self.current_dir.join(path)
+        };
+        let relative = joined.strip_prefix("/").unwrap_or(&joined);
+        self.allowed_roots
+            .iter()
+            .map(|root| root.join(relative))
+            .collect()
+    }
+
+    /// 归一化 guest 绝对路径（解析 . 与 ..），用于 getcwd/chdir 维护当前目录。
+    fn normalize_guest_absolute(path: &Path) -> PathBuf {
+        let mut normalized = PathBuf::from("/");
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::Normal(seg) => normalized.push(seg),
+                _ => {}
+            }
+        }
+        normalized
     }
 
     /// 设置 TLS locale 地址和 pointer/stack guard 值。
@@ -1384,6 +1431,114 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(0);
         }
+        if event.nr == SYS_GETCWD {
+            // getcwd(buf, bufsiz)：返回 guest 视角当前目录（受控根内相对绝对路径）。
+            let buf = event.args[0];
+            let bufsiz = usize::try_from(event.args[1])
+                .map_err(|_| DaotiError::Other("getcwd 大小超出平台范围".into()))?;
+            let absolute = if self.current_dir.as_os_str().is_empty() {
+                PathBuf::from("/")
+            } else {
+                Self::normalize_guest_absolute(&Path::new("/").join(&self.current_dir))
+            };
+            let bytes = absolute.to_string_lossy().as_bytes().to_vec();
+            if bytes.len() + 1 > bufsiz {
+                return Ok(-34); // -ERANGE
+            }
+            memory.write(buf, &bytes)?;
+            memory.write(buf + bytes.len() as u64, &[0])?;
+            return Ok(bytes.len() as i64);
+        }
+        if event.nr == SYS_CHDIR {
+            // chdir(path)：仅允许进入受控根内真实存在的目录。
+            let mut raw = Vec::new();
+            for index in 0..4096u64 {
+                let byte = memory.read(event.args[0] + index, 1)?[0];
+                if byte == 0 {
+                    break;
+                }
+                raw.push(byte);
+            }
+            let path = Path::new(
+                std::str::from_utf8(&raw)
+                    .map_err(|_| DaotiError::Other("chdir 路径不是 UTF-8".into()))?,
+            );
+            let candidates = self.resolve_sandbox_candidates(path);
+            if !candidates.iter().any(|candidate| candidate.is_dir()) {
+                return Ok(-2); // -ENOENT
+            }
+            let joined = if path.is_absolute() {
+                path.to_path_buf()
+            } else if self.current_dir.as_os_str().is_empty() {
+                PathBuf::from("/").join(path)
+            } else {
+                self.current_dir.join(path)
+            };
+            let absolute = Self::normalize_guest_absolute(&joined);
+            self.current_dir = absolute
+                .strip_prefix("/")
+                .unwrap_or(&absolute)
+                .to_path_buf();
+            return Ok(0);
+        }
+        if event.nr == SYS_FSYNC {
+            // fsync(fd)：快照文件已在内存，无需落盘同步；校验 fd 存在性。
+            let fd = event.args[0] as i32;
+            if !self.files.contains_key(&fd) {
+                return Ok(-9); // -EBADF
+            }
+            return Ok(0);
+        }
+        if event.nr == SYS_FTRUNCATE {
+            // ftruncate(fd, length)：调整文件快照长度（缩小截断、扩大补零），
+            // 并将文件偏移钳制在文件末尾，避免后续 read 越界。
+            let fd = event.args[0] as i32;
+            let length = event.args[1];
+            let (bytes, cursor) = self
+                .files
+                .get_mut(&fd)
+                .ok_or_else(|| DaotiError::Other("无效文件描述符".into()))?;
+            let length = usize::try_from(length)
+                .map_err(|_| DaotiError::Other("ftruncate 长度超出平台范围".into()))?;
+            if length < bytes.len() {
+                bytes.truncate(length);
+            } else {
+                bytes.resize(length, 0);
+            }
+            if *cursor > length {
+                *cursor = length;
+            }
+            return Ok(0);
+        }
+        if event.nr == SYS_MKDIRAT {
+            // mkdirat(dirfd, pathname, mode)：仅 AT_FDCWD，创建受控根内目录（mode 不模拟）。
+            let dirfd = event.args[0] as i64;
+            if dirfd != -100 {
+                return Ok(-9); // -EBADF
+            }
+            let mode = event.args[2];
+            if mode & !0o777 != 0 {
+                return Err(DaotiError::Other("mkdirat mode 不是权限位".into()));
+            }
+            let mut raw = Vec::new();
+            for index in 0..4096u64 {
+                let byte = memory.read(event.args[1] + index, 1)?[0];
+                if byte == 0 {
+                    break;
+                }
+                raw.push(byte);
+            }
+            let path = Path::new(
+                std::str::from_utf8(&raw)
+                    .map_err(|_| DaotiError::Other("mkdirat 路径不是 UTF-8".into()))?,
+            );
+            let candidates = self.resolve_sandbox_candidates(path);
+            if let Some(candidate) = candidates.first() {
+                std::fs::create_dir(candidate).map_err(DaotiError::Io)?;
+                return Ok(0);
+            }
+            return Ok(-2); // -ENOENT：无受控根
+        }
         if event.nr == SYS_BRK {
             let raw = self.current_brk;
             let new_brk = event.args[0];
@@ -1722,6 +1877,66 @@ mod tests {
         assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
         assert!(!file.exists());
         let _ = std::fs::remove_dir(&root);
+    }
+
+    #[test]
+    fn chdir_then_getcwd_reflects_sandbox_relative_dir() {
+        let root = std::env::temp_dir().join(format!("daoti-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b"sub\0").unwrap();
+        let chdir = RuntimeSyscallEvent::enter(SYS_CHDIR, "chdir", [0x1100, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&chdir, &mut memory).unwrap(), 0);
+        let getcwd = RuntimeSyscallEvent::enter(SYS_GETCWD, "getcwd", [0x1200, 4096, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&getcwd, &mut memory).unwrap(), 4);
+        assert_eq!(&memory.read(0x1200, 4).unwrap(), b"/sub");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mkdirat_creates_directory_under_allowed_root() {
+        let root = std::env::temp_dir().join(format!("daoti-mkdir-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b"newdir\0").unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_MKDIRAT,
+            "mkdirat",
+            [-100i64 as u64, 0x1100, 0, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        assert!(root.join("newdir").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fsync_validates_descriptor() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        bridge.files.insert(9, (b"data".to_vec(), 0));
+        let mut memory = memory();
+        let ok = RuntimeSyscallEvent::enter(SYS_FSYNC, "fsync", [9, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&ok, &mut memory).unwrap(), 0);
+        let bad = RuntimeSyscallEvent::enter(SYS_FSYNC, "fsync", [999, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -9);
+    }
+
+    #[test]
+    fn ftruncate_adjusts_snapshot_size_and_keeps_offset_in_bounds() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        bridge.files.insert(9, (b"abcdef".to_vec(), 5));
+        let mut memory = memory();
+        let shrink = RuntimeSyscallEvent::enter(SYS_FTRUNCATE, "ftruncate", [9, 3, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&shrink, &mut memory).unwrap(), 0);
+        let bytes = &bridge.files.get(&9).unwrap().0;
+        assert_eq!(bytes, b"abc");
+        assert!(bridge.files.get(&9).unwrap().1 <= 3);
+        let grow = RuntimeSyscallEvent::enter(SYS_FTRUNCATE, "ftruncate", [9, 8, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&grow, &mut memory).unwrap(), 0);
+        assert_eq!(bridge.files.get(&9).unwrap().0, b"abc\0\0\0\0\0");
     }
 
     #[test]
