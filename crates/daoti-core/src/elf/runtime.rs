@@ -312,6 +312,50 @@ impl MemoryModel {
         Ok(())
     }
 
+    pub fn mmap_fixed_replace(
+        &mut self,
+        addr: u64,
+        len: u64,
+        perm: MemPerm,
+    ) -> Result<(), DaotiError> {
+        if len == 0 || !addr.is_multiple_of(4096) {
+            return Err(DaotiError::Other("mmap 固定地址或长度无效".into()));
+        }
+        let end = addr
+            .checked_add(len)
+            .ok_or_else(|| DaotiError::Other("mmap 固定地址范围溢出".into()))?;
+        if end > self.max_addr {
+            return Err(DaotiError::Other("mmap 固定地址越界".into()));
+        }
+        let mut retained = Vec::with_capacity(self.regions.len() + 1);
+        for region in self.regions.drain(..) {
+            if region.end() <= addr || region.base >= end {
+                retained.push(region);
+                continue;
+            }
+            if region.base < addr {
+                let prefix_len = (addr - region.base) as usize;
+                retained.push(MemoryRegion::with_data(
+                    region.base,
+                    region.perm,
+                    region.bytes[..prefix_len].to_vec(),
+                ));
+            }
+            if region.end() > end {
+                let suffix_start = (end - region.base) as usize;
+                retained.push(MemoryRegion::with_data(
+                    end,
+                    region.perm,
+                    region.bytes[suffix_start..].to_vec(),
+                ));
+            }
+        }
+        retained.push(MemoryRegion::with_data(addr, perm, vec![0; len as usize]));
+        retained.sort_by_key(|region| region.base);
+        self.regions = retained;
+        Ok(())
+    }
+
     pub fn mprotect(&mut self, addr: u64, len: u64, perm: MemPerm) -> Result<(), DaotiError> {
         if len == 0 || !addr.is_multiple_of(4096) {
             return Err(DaotiError::Other("mprotect 地址或长度无效".into()));
@@ -319,6 +363,19 @@ impl MemoryModel {
         let end = addr
             .checked_add(len)
             .ok_or_else(|| DaotiError::Other("mprotect 范围溢出".into()))?;
+        if std::env::var_os("DAOTI_TRACE_MPROTECT").is_some() {
+            eprintln!("TRACE mprotect-request addr=0x{addr:x} len=0x{len:x} end=0x{end:x}");
+            for region in &self.regions {
+                if addr < region.end() && region.base < end {
+                    eprintln!(
+                        "TRACE mprotect-overlap base=0x{:x} end=0x{:x} perm={:?}",
+                        region.base,
+                        region.end(),
+                        region.perm
+                    );
+                }
+            }
+        }
         let index = self
             .regions
             .iter()
@@ -496,9 +553,48 @@ impl MemoryModel {
 
     fn find_region_mut(&mut self, addr: u64, len: u64) -> Result<&mut MemoryRegion, DaotiError> {
         let end = addr.saturating_add(len);
-        self.regions
-            .iter_mut()
-            .find(|r| addr >= r.base && end <= r.end())
+        let region_index = self
+            .regions
+            .iter()
+            .position(|r| addr >= r.base && end <= r.end());
+        if region_index.is_none() && std::env::var_os("DAOTI_TRACE_WRITE_FAULT").is_some() {
+            let rip = LAST_INTERPRETER_RIP.load(Ordering::Relaxed);
+            eprintln!(
+                "TRACE write-fault addr=0x{addr:x} len=0x{len:x} end=0x{end:x} rip=0x{rip:x} rax=0x{:x} rbx=0x{:x} rcx=0x{:x} rdx=0x{:x} rsi=0x{:x} rdi=0x{:x} r12=0x{:x} r13=0x{:x} r14=0x{:x} r15=0x{:x}",
+                LAST_INTERPRETER_RAX.load(Ordering::Relaxed),
+                LAST_INTERPRETER_RBX.load(Ordering::Relaxed),
+                LAST_INTERPRETER_RCX.load(Ordering::Relaxed),
+                LAST_INTERPRETER_RDX.load(Ordering::Relaxed),
+                LAST_INTERPRETER_RSI.load(Ordering::Relaxed),
+                LAST_INTERPRETER_RDI.load(Ordering::Relaxed),
+                LAST_INTERPRETER_R12.load(Ordering::Relaxed),
+                LAST_INTERPRETER_R13.load(Ordering::Relaxed),
+                LAST_INTERPRETER_R14.load(Ordering::Relaxed),
+                LAST_INTERPRETER_R15.load(Ordering::Relaxed),
+            );
+            for region in &self.regions {
+                eprintln!(
+                    "TRACE write-region base=0x{:x} end=0x{:x}",
+                    region.base,
+                    region.end()
+                );
+            }
+            if std::env::var_os("DAOTI_TRACE_INSN_HISTORY").is_some() {
+                if let Ok(hist) = LAST_INSN_HISTORY.lock() {
+                    let skip = hist.len().saturating_sub(20);
+                    eprintln!(
+                        "TRACE write-history-before-fault total={} last={}",
+                        hist.len(),
+                        hist.len() - skip
+                    );
+                    for (hrip, hbytes) in hist.iter().skip(skip) {
+                        eprintln!("TRACE winsn RIP=0x{hrip:x} BYTES={hbytes:02x?}");
+                    }
+                }
+            }
+        }
+        region_index
+            .map(|index| &mut self.regions[index])
             .ok_or_else(|| DaotiError::Other(format!("地址不可访问：0x{addr:x}")))
     }
 
@@ -830,7 +926,9 @@ impl MemoryModel {
 
 #[cfg(test)]
 mod memory_model_tests {
-    use super::{MemPerm, MemoryModel, MemoryRegion};
+    use super::{
+        ExecutionState, MemPerm, MemoryModel, MemoryRegion, RuntimeContext, X86_64Interpreter,
+    };
 
     fn writable_memory() -> MemoryModel {
         let mut memory = MemoryModel::new(0x2700000, 0x2760000);
@@ -846,6 +944,42 @@ mod memory_model_tests {
             ))
             .unwrap();
         memory
+    }
+
+    #[test]
+    fn movlpd_load_preserves_high_xmm_lane() {
+        let mut memory = MemoryModel::new(0x1000, 0x3000);
+        memory
+            .add_region(MemoryRegion::with_data(0x1000, MemPerm::rwx(), {
+                let mut code = vec![
+                    0x66, 0x0f, 0x6f, 0x05, 0xf8, 0x07, 0x00, 0x00, // movdqu xmm0,[0x1800]
+                    0x66, 0x0f, 0x12, 0x05, 0x00, 0x08, 0x00, 0x00, // movlpd xmm0,[0x1810]
+                    0x0f, 0x11, 0x05, 0x09, 0x08, 0x00, 0x00, // movups [0x1820],xmm0
+                    0xf4,
+                ];
+                code.resize(0x1000, 0x90);
+                code
+            }))
+            .unwrap();
+        memory
+            .write(
+                0x1800,
+                &[
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                    0xbb, 0xbb, 0xbb, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+                ],
+            )
+            .unwrap();
+        let context = RuntimeContext::new(0x1000, 0x2000, memory);
+        let mut interpreter = X86_64Interpreter::new(context);
+        assert_eq!(interpreter.run().unwrap(), ExecutionState::Faulted);
+        assert_eq!(
+            interpreter.context.memory.read(0x1820, 16).unwrap(),
+            &[
+                0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                0xbb, 0xbb,
+            ]
+        );
     }
 
     #[test]
@@ -866,6 +1000,24 @@ mod memory_model_tests {
         assert_eq!(interpreter.context.registers.general.rax, 0x9abc_def0);
         assert_eq!(interpreter.context.registers.general.rcx, 0x1234_5678);
         assert_eq!(interpreter.context.registers.general.rip, 0x1001);
+    }
+
+    #[test]
+    fn lea_sib_rex_x_uses_r12_as_index() {
+        let mut memory = MemoryModel::new(0x1000, 0x3000);
+        memory
+            .add_region(MemoryRegion::with_data(0x1000, MemPerm::rwx(), {
+                let mut bytes = vec![0x4a, 0x8d, 0x14, 0x23, 0xf4];
+                bytes.resize(0x100, 0x90);
+                bytes
+            }))
+            .unwrap();
+        let mut context = super::RuntimeContext::new(0x1000, 0x2000, memory);
+        context.registers.general.rbx = 0x100;
+        context.registers.general.r12 = 0x2000;
+        let mut interpreter = super::X86_64Interpreter::new(context);
+        assert_eq!(interpreter.run().unwrap(), super::ExecutionState::Faulted);
+        assert_eq!(interpreter.context.registers.general.rdx, 0x2100);
     }
 
     #[test]
@@ -2925,6 +3077,27 @@ impl<'a> X86_64Interpreter<'a> {
                     } else {
                         None
                     };
+                    if name == "mprotect_call" {
+                        let read_u64 = |addr: u64| {
+                            self.context
+                                .memory
+                                .read(addr, 8)
+                                .ok()
+                                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        };
+                        eprintln!(
+                            "TRACE mprotect-call r14=0x{:x} [r14]={:?} [r14+4a0]={:?} [r14+4a8]={:?} rax=0x{:x} rcx=0x{:x} rdi=0x{:x} rsi=0x{:x} rdx=0x{:x}",
+                            g.r14,
+                            read_u64(g.r14),
+                            read_u64(g.r14 + 0x4a0),
+                            read_u64(g.r14 + 0x4a8),
+                            g.rax,
+                            g.rcx,
+                            g.rdi,
+                            g.rsi,
+                            g.rdx,
+                        );
+                    }
                     if name == "int_malloc_corrupted" {
                         let read_u64 = |addr: u64| {
                             self.context
@@ -4872,7 +5045,7 @@ impl<'a> X86_64Interpreter<'a> {
                         };
                         let scale_shift = ((sib >> 6) & 3) as u32;
                         let index_field = (sib >> 3) & 7;
-                        let index = if index_field == 4 {
+                        let index = if index_field == 4 && rex & 2 == 0 {
                             0
                         } else {
                             let index_reg = index_field as usize | if rex & 2 != 0 { 8 } else { 0 };
@@ -5883,6 +6056,66 @@ impl<'a> X86_64Interpreter<'a> {
                     self.context.registers.general.rip = rip + p as u64;
                     continue;
                 }
+                0x69 => {
+                    // imul r16/r32/r64, r/m16/r/m32/r/m64, imm16/imm32
+                    let m = *bytes
+                        .get(p)
+                        .ok_or_else(|| DaotiError::Other("imul 立即数 ModR/M 截断".into()))?;
+                    p += 1;
+                    let dst = ((m >> 3) & 7) as usize | if rex & 4 != 0 { 8 } else { 0 };
+                    let mod_ = m & 0xc0;
+                    let rm = m & 7;
+                    let width = if opsz16 {
+                        2
+                    } else if rex & 0x08 != 0 {
+                        8
+                    } else {
+                        4
+                    };
+                    let mask = match width {
+                        2 => 0xffff,
+                        4 => 0xffff_ffff,
+                        _ => u64::MAX,
+                    };
+                    let source = if mod_ == 0xc0 {
+                        *self.reg(rm as usize | if rex & 1 != 0 { 8 } else { 0 }) & mask
+                    } else {
+                        let (_reg, addr) = self.resolve_dst(mod_, rm, rex, &bytes, &mut p)?;
+                        let addr = addr
+                            .ok_or_else(|| DaotiError::Other("imul 立即数需要内存地址".into()))?;
+                        let raw = self.context.memory.read(addr, width as u64)?;
+                        match width {
+                            2 => u16::from_le_bytes(raw.try_into().unwrap()) as u64,
+                            4 => u32::from_le_bytes(raw.try_into().unwrap()) as u64,
+                            _ => u64::from_le_bytes(raw.try_into().unwrap()),
+                        }
+                    };
+                    let immediate_len = if width == 2 { 2 } else { 4 };
+                    if p + immediate_len > bytes.len() {
+                        return Err(DaotiError::Other("imul 立即数截断".into()));
+                    }
+                    let immediate = if width == 2 {
+                        i16::from_le_bytes(bytes[p..p + 2].try_into().unwrap()) as i64
+                    } else {
+                        i32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as i64
+                    };
+                    p += immediate_len;
+                    let source_signed = match width {
+                        2 => (source as i16) as i64,
+                        4 => (source as i32) as i64,
+                        _ => source as i64,
+                    };
+                    let result = source_signed.wrapping_mul(immediate) as u64 & mask;
+                    if width == 2 {
+                        *self.reg_mut(dst) = (*self.reg(dst) & !0xffff) | result;
+                    } else if width == 4 {
+                        *self.reg_mut(dst) = result as u32 as u64;
+                    } else {
+                        *self.reg_mut(dst) = result;
+                    }
+                    self.context.registers.general.rip = rip + p as u64;
+                    continue;
+                }
                 0x81 => {
                     let m = *bytes
                         .get(p)
@@ -6227,13 +6460,13 @@ impl<'a> X86_64Interpreter<'a> {
                     p += 1;
                     match op2 {
                         0x1e => {
-                            let modrm = *bytes
+                            // endbr64(f3 0f 1e fa)/endbr32(f3 0f 1e fb)/notrack
+                            // 与 reserved NOP（0f 1e <modrm>）均无操作；GCC 也把
+                            // 0f 1e 用作对齐 padding，仅需跳过 ModR/M 字节。
+                            let _modrm = *bytes
                                 .get(p)
-                                .ok_or_else(|| DaotiError::Other("endbr64 指令截断".into()))?;
+                                .ok_or_else(|| DaotiError::Other("0x0f 0x1e 指令截断".into()))?;
                             p += 1;
-                            if modrm != 0xfa {
-                                return Err(DaotiError::Other("不支持的 0x0f 0x1e 扩展".into()));
-                            }
                             self.context.registers.general.rip = rip + p as u64;
                             continue;
                         }
@@ -6293,7 +6526,18 @@ impl<'a> X86_64Interpreter<'a> {
                                     args, ret_addr.unwrap_or(0));
                             }
                             if std::env::var_os("DAOTI_TRACE_SYSCALLS").is_some() {
-                                eprintln!("TRACE syscall nr={nr} args={args:x?} rip=0x{rip:x}");
+                                let rsp = self.context.registers.general.rsp;
+                                let ret_addr = if rsp >= 0x400000 {
+                                    self.context
+                                        .memory
+                                        .read(rsp, 8)
+                                        .ok()
+                                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                                } else {
+                                    None
+                                };
+                                eprintln!("TRACE syscall nr={nr} args={args:x?} rip=0x{rip:x} rsp=0x{rsp:x} ret=0x{:x}",
+                                    ret_addr.unwrap_or(0));
                             }
                             let name = match nr {
                                 21 => "access",
@@ -7010,6 +7254,17 @@ impl<'a> X86_64Interpreter<'a> {
         let rm = m & 7;
         // 将 mod_ 转为 0xc0/0x40/0x80/0x00 格式
         let mod_val = mod_ << 6;
+        let trace_sse = std::env::var_os("DAOTI_TRACE_SSE").is_some();
+        let xmm0_before = self.xmm[0];
+        if trace_sse && (0x271e200..=0x271e340).contains(&rip) {
+            eprintln!("TRACE sse-state-before rip=0x{rip:x} op2=0x{op2:02x} rep=0x{rep:02x} xmm0=0x{xmm0_before:x}");
+        }
+        if trace_sse && op2 == 0x7e {
+            eprintln!(
+                "TRACE sse-7e rip=0x{rip:x} rep=0x{rep:02x} modrm=0x{m:02x} reg={} rm={}",
+                reg_field, rm
+            );
+        }
         let () = match op2 {
             0x73 => {
                 let count = *bytes
@@ -7243,19 +7498,41 @@ impl<'a> X86_64Interpreter<'a> {
             }
             0x7e => {
                 let value = self.xmm[reg_field].to_le_bytes();
-                // REX.W 或 F3 前缀表示 movq；否则为 movd。
-                let is_qword = rex & 0x08 != 0 || rep == 0xf3;
-                if mod_ == 3 {
-                    let dst = rm as usize | if rex & 1 != 0 { 8 } else { 0 };
-                    *self.reg_mut(dst) = if is_qword {
-                        u64::from_le_bytes(value[0..8].try_into().unwrap())
+                // F3 0F 7E 是 MOVQ xmm, xmm/m64（加载方向：rm → xmm[reg]，高 64 位清零），
+                // 与 REX.W 的 0F 7E（存储方向）方向相反，必须先分流。
+                if rep == 0xf3 {
+                    let (src, source_addr) = if mod_ == 3 {
+                        (
+                            self.xmm[rm as usize | if rex & 1 != 0 { 8 } else { 0 }] as u64,
+                            None,
+                        )
                     } else {
-                        u32::from_le_bytes(value[0..4].try_into().unwrap()) as u64
+                        let addr = self.resolve_sse_mem(mod_val, rm, rex, bytes, p, rip)?;
+                        let raw = self.context.memory.read(addr, 8)?;
+                        (u64::from_le_bytes(raw.try_into().unwrap()), Some(addr))
                     };
+                    if std::env::var_os("DAOTI_TRACE_SSE").is_some() {
+                        eprintln!(
+                            "TRACE sse-7e-load rip=0x{rip:x} xmm={} source_addr={source_addr:#x?} value=0x{src:x}",
+                            reg_field
+                        );
+                    }
+                    self.xmm[reg_field] = src as u128;
                 } else {
-                    let addr = self.resolve_sse_mem(mod_val, rm, rex, bytes, p, rip)?;
-                    let size = if is_qword { 8 } else { 4 };
-                    self.context.memory.write(addr, &value[..size])?;
+                    // 普通 0F 7E：MOVD/MOVQ xmm → r/m（存储方向）；REX.W 表示 movq。
+                    let is_qword = rex & 0x08 != 0;
+                    if mod_ == 3 {
+                        let dst = rm as usize | if rex & 1 != 0 { 8 } else { 0 };
+                        *self.reg_mut(dst) = if is_qword {
+                            u64::from_le_bytes(value[0..8].try_into().unwrap())
+                        } else {
+                            u32::from_le_bytes(value[0..4].try_into().unwrap()) as u64
+                        };
+                    } else {
+                        let addr = self.resolve_sse_mem(mod_val, rm, rex, bytes, p, rip)?;
+                        let size = if is_qword { 8 } else { 4 };
+                        self.context.memory.write(addr, &value[..size])?;
+                    }
                 }
             }
             0x10 | 0x12 | 0x16 | 0x28 | 0x6f | 0x57 | 0x58 | 0x59 | 0x74 | 0xef | 0xf8 => {
@@ -7269,10 +7546,23 @@ impl<'a> X86_64Interpreter<'a> {
                     }
                     u128::from_le_bytes(result)
                 };
-                if mod_ == 3 {
+                if op2 == 0x16 && mod_ != 3 {
+                    // movhps 内存形式：只加载 8 字节到高半部，保留低半部。
+                    let addr = self.resolve_sse_mem(mod_val, rm, rex, bytes, p, rip)?;
+                    let raw = self.context.memory.read(addr, 8)?;
+                    let mut value = self.xmm[reg_field].to_le_bytes();
+                    value[8..16].copy_from_slice(raw);
+                    self.xmm[reg_field] = u128::from_le_bytes(value);
+                } else if mod_ == 3 {
                     // 寄存器形式
                     let src = self.xmm[rm as usize | if rex & 1 != 0 { 8 } else { 0 }];
                     self.xmm[reg_field] = match op2 {
+                        0x12 => {
+                            // MOVLPD 的寄存器形式只替换低 64 位，高 64 位保持不变。
+                            let mut value = self.xmm[reg_field].to_le_bytes();
+                            value[..8].copy_from_slice(&src.to_le_bytes()[..8]);
+                            u128::from_le_bytes(value)
+                        }
                         0x57 | 0xef => self.xmm[reg_field] ^ src,
                         0x58 | 0x59 => {
                             // 0f 58/59 是 addps/mulps；F3 前缀切换为只处理低位 lane 的 addss/mulss。
@@ -7319,50 +7609,60 @@ impl<'a> X86_64Interpreter<'a> {
                     };
                 } else {
                     let addr = self.resolve_sse_mem(mod_val, rm, rex, bytes, p, rip)?;
-                    // movq 使用 F2，movdqu 使用 F3，二者都不能把 F3 误当成 4 字节 movd。
-                    let size = if op2 == 0x6f && rep == 0xf3 {
-                        16
-                    } else if rep == 0xf2 {
-                        8
+                    if op2 == 0x12 {
+                        // MOVLPD（66 0F 12 /r，mod≠3）：只把内存低 8 字节载入
+                        // 目标 XMM 低 64 位，高 64 位保持不变。
+                        let raw = self.context.memory.read(addr, 8)?;
+                        let mut value = self.xmm[reg_field].to_le_bytes();
+                        value[..8].copy_from_slice(raw);
+                        self.xmm[reg_field] = u128::from_le_bytes(value);
                     } else {
-                        16
-                    };
-                    let raw = self.context.memory.read(addr, size)?;
-                    let mut buf = [0u8; 16];
-                    buf[..size as usize].copy_from_slice(raw);
-                    let src = u128::from_le_bytes(buf);
-                    self.xmm[reg_field] = match op2 {
-                        0x57 | 0xef => self.xmm[reg_field] ^ src,
-                        0x58 | 0x59 => {
-                            // 内存形式的 addps/mulps，以及 F3 前缀的 addss/mulss。
-                            let dst = self.xmm[reg_field].to_le_bytes();
-                            let src = src.to_le_bytes();
-                            let lanes = if rep == 0xf3 { 1 } else { 4 };
-                            let mut out = dst;
-                            for lane in 0..lanes {
-                                let a = f32::from_le_bytes(
-                                    dst[lane * 4..lane * 4 + 4].try_into().unwrap(),
-                                );
-                                let b = f32::from_le_bytes(
-                                    src[lane * 4..lane * 4 + 4].try_into().unwrap(),
-                                );
-                                let value = if op2 == 0x58 { a + b } else { a * b };
-                                out[lane * 4..lane * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                        // movq 使用 F2，movdqu 使用 F3，二者都不能把 F3 误当成 4 字节 movd。
+                        let size = if op2 == 0x6f && rep == 0xf3 {
+                            16
+                        } else if rep == 0xf2 {
+                            8
+                        } else {
+                            16
+                        };
+                        let raw = self.context.memory.read(addr, size)?;
+                        let mut buf = [0u8; 16];
+                        buf[..size as usize].copy_from_slice(raw);
+                        let src = u128::from_le_bytes(buf);
+                        self.xmm[reg_field] = match op2 {
+                            0x57 | 0xef => self.xmm[reg_field] ^ src,
+                            0x58 | 0x59 => {
+                                // 内存形式的 addps/mulps，以及 F3 前缀的 addss/mulss。
+                                let dst = self.xmm[reg_field].to_le_bytes();
+                                let src = src.to_le_bytes();
+                                let lanes = if rep == 0xf3 { 1 } else { 4 };
+                                let mut out = dst;
+                                for lane in 0..lanes {
+                                    let a = f32::from_le_bytes(
+                                        dst[lane * 4..lane * 4 + 4].try_into().unwrap(),
+                                    );
+                                    let b = f32::from_le_bytes(
+                                        src[lane * 4..lane * 4 + 4].try_into().unwrap(),
+                                    );
+                                    let value = if op2 == 0x58 { a + b } else { a * b };
+                                    out[lane * 4..lane * 4 + 4]
+                                        .copy_from_slice(&value.to_le_bytes());
+                                }
+                                u128::from_le_bytes(out)
                             }
-                            u128::from_le_bytes(out)
-                        }
-                        0x74 => pcmpeqb(self.xmm[reg_field], src),
-                        0xf8 => {
-                            // psubb：按 16 个无符号 8 位 lane 做模 256 减法。
-                            let mut value = self.xmm[reg_field].to_le_bytes();
-                            let source = src.to_le_bytes();
-                            for lane in 0..16 {
-                                value[lane] = value[lane].wrapping_sub(source[lane]);
+                            0x74 => pcmpeqb(self.xmm[reg_field], src),
+                            0xf8 => {
+                                // psubb：按 16 个无符号 8 位 lane 做模 256 减法。
+                                let mut value = self.xmm[reg_field].to_le_bytes();
+                                let source = src.to_le_bytes();
+                                for lane in 0..16 {
+                                    value[lane] = value[lane].wrapping_sub(source[lane]);
+                                }
+                                u128::from_le_bytes(value)
                             }
-                            u128::from_le_bytes(value)
-                        }
-                        _ => src,
-                    };
+                            _ => src,
+                        };
+                    }
                 }
             }
             0x11 | 0x29 | 0x7f => {
@@ -7388,6 +7688,13 @@ impl<'a> X86_64Interpreter<'a> {
             }
             _ => {}
         };
+        if trace_sse && (0x271e200..=0x271e340).contains(&rip) {
+            eprintln!(
+                "TRACE sse-state-after rip=0x{rip:x} next=0x{:x} xmm0=0x{:x}",
+                rip + *p as u64,
+                self.xmm[0]
+            );
+        }
         Ok(rip + *p as u64)
     }
 
@@ -7435,7 +7742,15 @@ impl<'a> X86_64Interpreter<'a> {
             };
             let base_field = sib & 7;
             let addr = if mod_val == 0 && base_field == 5 {
-                disp as u64
+                let scale_shift = ((sib >> 6) & 3) as u32;
+                let index_field = (sib >> 3) & 7;
+                let index = if index_field == 4 && rex & 2 == 0 {
+                    0
+                } else {
+                    let index_reg = index_field as usize | if rex & 2 != 0 { 8 } else { 0 };
+                    self.reg(index_reg).wrapping_shl(scale_shift)
+                };
+                index.wrapping_add(disp as u64)
             } else {
                 self.sib_addr(sib, rex, disp)?
             };
@@ -7497,9 +7812,11 @@ impl<'a> X86_64Interpreter<'a> {
             let addr = next_rip.wrapping_add(d as i64 as u64);
             let addr = self.seg_addr(addr);
             if std::env::var_os("DAOTI_TRACE_SBRK_RIPREL").is_some()
-                && self.load_bias.is_some_and(|bias| {
+                && (self.load_bias.is_some_and(|bias| {
                     (bias + 0x11a8a0..bias + 0x11a950).contains(&self.context.registers.general.rip)
-                })
+                }) || self.load_bias.is_some_and(|bias| {
+                    (bias + 0xc080..bias + 0xc180).contains(&self.context.registers.general.rip)
+                }))
             {
                 eprintln!(
                     "TRACE sbrk-riprel rip=0x{:x} p={} disp=0x{:x} next=0x{next_rip:x} addr=0x{addr:x} fs_override={} fs=0x{:x}",
@@ -7582,7 +7899,7 @@ impl<'a> X86_64Interpreter<'a> {
             let addr = if mod_ == 0 && sib & 7 == 5 {
                 let scale_shift = ((sib >> 6) & 3) as u32;
                 let index_field = (sib >> 3) & 7;
-                let index = if index_field == 4 {
+                let index = if index_field == 4 && rex & 2 == 0 {
                     0
                 } else {
                     let index_reg = index_field as usize | if rex & 2 != 0 { 8 } else { 0 };

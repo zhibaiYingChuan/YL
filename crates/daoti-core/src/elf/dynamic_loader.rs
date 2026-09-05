@@ -1780,13 +1780,9 @@ where
         let bump_region_size = 1024u64 * 1024;
         let bump_region_base = tls_region_base
             .checked_add(tls_region_size)
-            .ok_or_else(|| DaotiError::Other("bump 区地址溢出".into()))?
-            .checked_add(PAGE_SIZE)
             .ok_or_else(|| DaotiError::Other("bump 区地址溢出".into()))?;
         let heap_addr = bump_region_base
             .checked_add(bump_region_size)
-            .ok_or_else(|| DaotiError::Other("堆地址溢出".into()))?
-            .checked_add(PAGE_SIZE)
             .ok_or_else(|| DaotiError::Other("堆地址溢出".into()))?;
         let heap_size: u64 = 8 * 1024 * 1024;
         let heap_end = heap_addr
@@ -2044,8 +2040,39 @@ where
             // 可执行程序段并触发 main_map != NULL 断言。因此符号解析不到时
             // 一律跳过预置，完全依赖 __minimal_malloc 自初始化（alloc_end==0
             // → alloc_ptr=&_end 页内 bump，不足时 __mmap 扩容）。
-            let alloc_end_addr = lookup("alloc_end").map(|offset| bias + offset);
-            let alloc_ptr_addr = lookup("alloc_ptr").map(|offset| bias + offset);
+            let mut alloc_end_addr = lookup("alloc_end").map(|offset| bias + offset);
+            let mut alloc_ptr_addr = lookup("alloc_ptr").map(|offset| bias + offset);
+            // 发行版 ld-linux 通常剥离 .symtab。对已验证的 glibc 2.39
+            // __minimal_malloc 指令签名，解析其 RIP 相对槽地址，补齐
+            // alloc_end/alloc_ptr；不能依赖自初始化，因为 2.39 的自初始化
+            // 只写 alloc_end，alloc_ptr 仍为零会让首次 calloc 返回 NULL。
+            if alloc_end_addr.is_none() || alloc_ptr_addr.is_none() {
+                let signature = [0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5];
+                let read_rip_slot = |offset: usize, instruction_offset: usize| {
+                    let start = offset + instruction_offset;
+                    let bytes = interp.bytes.get(start..start + 7)?;
+                    if bytes.get(0..3)? != [0x48, 0x8b, 0x15]
+                        && bytes.get(0..3)? != [0x48, 0x8b, 0x05]
+                    {
+                        return None;
+                    }
+                    let displacement = i32::from_le_bytes(bytes[3..7].try_into().ok()?) as i64;
+                    let next = bias + offset as u64 + instruction_offset as u64 + 7;
+                    Some((next as i64 + displacement) as u64)
+                };
+                for (offset, window) in interp.bytes.windows(signature.len()).enumerate() {
+                    if window != signature {
+                        continue;
+                    }
+                    let end = read_rip_slot(offset, 0x14).filter(|&address| owns(address));
+                    let ptr = read_rip_slot(offset, 0x24).filter(|&address| owns(address));
+                    if end.is_some() && ptr.is_some() {
+                        alloc_end_addr = alloc_end_addr.or(end);
+                        alloc_ptr_addr = alloc_ptr_addr.or(ptr);
+                        break;
+                    }
+                }
+            }
             let alloc_end_found = alloc_end_addr.is_some();
             let alloc_ptr_found = alloc_ptr_addr.is_some();
             // bump 区与 libc malloc 堆分离：alloc 区终点 = bump 区末尾。
@@ -2093,8 +2120,8 @@ where
                     .unwrap_or_else(|| "n/a".to_string());
                 eprintln!(
                     "TRACE init-ldso-alloc bias=0x{bias:x} ldso=[0x{ldso_min:x},0x{ldso_max:x}) alloc_ptr={alloc_ptr_info}(symtab={alloc_ptr_found},in_range={})<-0x{bump_region_base:x} alloc_end={alloc_end_info}(symtab={alloc_end_found},in_range={})<-0x{:x} minimal_malloc=0x{:x} minimal_free=0x{:x} minimal_realloc=0x{:x} minimal_calloc=0x{:x}",
-                    alloc_ptr_addr.map_or(false, owns),
-                    alloc_end_addr.map_or(false, owns),
+                    alloc_ptr_addr.is_some_and(owns),
+                    alloc_end_addr.is_some_and(owns),
                     bump_region_base + bump_region_size,
                     minimal_malloc.map(|o| bias + o).unwrap_or(0),
                     minimal_free.map(|o| bias + o).unwrap_or(0),

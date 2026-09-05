@@ -66,6 +66,7 @@ pub const MAP_FAILED: i64 = -1;
 #[derive(Debug, Default)]
 struct AppliedRelocations {
     tls: Option<(u64, u64, u64, u64)>,
+    curbrk: Option<u64>,
 }
 
 /// 向上对齐到 align（align 应为 2 的幂；<=1 时原样返回）。
@@ -170,6 +171,7 @@ fn apply_elf_runtime_relocations(
     // 扫描动态段收集 DT_RELA / DT_JMPREL / DT_SYMTAB
     let mut dt_symtab: Option<u64> = None;
     let mut dt_strtab: Option<u64> = None;
+    let mut dt_hash: Option<u64> = None;
     let mut dt_rela: Option<(u64, u64)> = None;
     let mut dt_jmprel: Option<(u64, u64)> = None;
     let mut off: usize = 0;
@@ -187,6 +189,7 @@ fn apply_elf_runtime_relocations(
         match tag {
             DT_NULL => break,
             DT_SYMTAB => dt_symtab = Some(val),
+            4 => dt_hash = Some(val),
             5 => dt_strtab = Some(val),
             DT_RELA => dt_rela = Some((val, 0)),
             DT_RELASZ => {
@@ -205,9 +208,51 @@ fn apply_elf_runtime_relocations(
         off += 16;
     }
 
+    let find_symbol_value = |wanted: &[u8]| {
+        dt_hash
+            .and_then(|hash| vaddr_to_offset(hash, 8))
+            .and_then(|hash_off| {
+                let nchain =
+                    u32::from_le_bytes(bytes[hash_off + 4..hash_off + 8].try_into().ok()?) as u64;
+                let symtab = dt_symtab?;
+                let strtab = dt_strtab?;
+                (0..nchain).find_map(|index| {
+                    let sym_off = vaddr_to_offset(symtab + index * 24, 24)?;
+                    let name_offset =
+                        u32::from_le_bytes(bytes[sym_off..sym_off + 4].try_into().ok()?) as u64;
+                    let name_off = vaddr_to_offset(strtab + name_offset, 1)?;
+                    let name = bytes[name_off..]
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .unwrap_or_default();
+                    if name == wanted {
+                        Some(u64::from_le_bytes(
+                            bytes[sym_off + 8..sym_off + 16].try_into().ok()?,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+    };
+    let curbrk_symbol_value = find_symbol_value(b"__curbrk");
+    let sbrk_symbol_value = find_symbol_value(b"__sbrk");
+    let sbrk_ready_flag = sbrk_symbol_value.and_then(|sbrk| {
+        let code =
+            vaddr_to_offset(sbrk, 0x30).and_then(|offset| bytes.get(offset..offset + 0x30))?;
+        for index in 0..code.len().saturating_sub(7) {
+            if code[index..index + 2] == [0x80, 0x3d] && code[index + 6] == 0 {
+                let displacement =
+                    i32::from_le_bytes(code[index + 2..index + 6].try_into().ok()?) as i64;
+                let next = sbrk + index as u64 + 7;
+                return Some(next.wrapping_add_signed(displacement));
+            }
+        }
+        None
+    });
     let mut applied = 0usize;
     let mut skipped = 0usize;
-    let mut curbrk_relocated = false;
+    let mut curbrk_addr = None;
     let reloc_tables: [(Option<(u64, u64)>, &str); 2] = [(dt_rela, "rela"), (dt_jmprel, "jmprel")];
     for (table, label) in reloc_tables {
         let Some((base_vaddr, size)) = table else {
@@ -282,7 +327,11 @@ fn apply_elf_runtime_relocations(
                                     .is_some_and(|value| value == b"__curbrk")
                             });
                         if is_curbrk {
-                            Some(addr.wrapping_add(0x222218))
+                            let Some(curbrk_offset) = curbrk_symbol_value else {
+                                skipped += 1;
+                                continue;
+                            };
+                            Some(addr.wrapping_add(curbrk_offset))
                         } else {
                             skipped += 1;
                             continue;
@@ -308,8 +357,13 @@ fn apply_elf_runtime_relocations(
                     continue;
                 }
                 applied += 1;
-                if r_offset == 0x219e60 && r_type == R_X86_64_GLOB_DAT && value != 0 {
-                    curbrk_relocated = true;
+                if r_type == R_X86_64_GLOB_DAT && value != 0 {
+                    let Some(curbrk_offset) = curbrk_symbol_value else {
+                        continue;
+                    };
+                    if value == addr.wrapping_add(curbrk_offset) {
+                        curbrk_addr = Some(value);
+                    }
                 }
                 if std::env::var_os("DAOTI_TRACE_RELOCATIONS").is_some() {
                     eprintln!(
@@ -319,21 +373,26 @@ fn apply_elf_runtime_relocations(
             }
         }
     }
-    if curbrk_relocated {
+    if let Some(curbrk) = curbrk_addr {
         // glibc __sbrk 的快速路径用该字节表示 __curbrk 已可由 brk 更新。
         // fd-mmap 副本没有真实 ld.so 的早期初始化副作用，需在 GOT 就绪后补齐。
-        memory.write(addr + 0x228e4e, &[1])?;
-        if std::env::var_os("DAOTI_TRACE_RELOCATIONS").is_some() {
-            eprintln!(
-                "TRACE runtime-reloc curbrk-ready flag=0x{:x}",
-                addr + 0x228e4e
-            );
+        if let Some(flag_offset) = sbrk_ready_flag {
+            let flag_addr = addr + flag_offset;
+            memory.write(flag_addr, &[1])?;
+            if std::env::var_os("DAOTI_TRACE_RELOCATIONS").is_some() {
+                eprintln!(
+                    "TRACE runtime-reloc curbrk=0x{curbrk:x} curbrk-ready flag=0x{flag_addr:x}"
+                );
+            }
         }
     }
     if std::env::var_os("DAOTI_TRACE_RELOCATIONS").is_some() {
         eprintln!("TRACE runtime-reloc done bias=0x{addr:x} applied={applied} skipped={skipped}");
     }
-    Ok(AppliedRelocations { tls })
+    Ok(AppliedRelocations {
+        tls,
+        curbrk: curbrk_addr,
+    })
 }
 
 pub trait OutputSink: Send {
@@ -489,6 +548,22 @@ struct ElfTlsImage {
     image: Vec<u8>,
     memsz: u64,
     align: u64,
+}
+
+fn relocate_tls_image_internal_pointers(
+    image: &mut [u8],
+    load_bias: u64,
+    load_ranges: &[(u64, u64)],
+) {
+    for chunk in image.chunks_exact_mut(8) {
+        let value = u64::from_le_bytes(chunk.try_into().unwrap());
+        if load_ranges
+            .iter()
+            .any(|(start, end)| value >= *start && value < *end)
+        {
+            chunk.copy_from_slice(&value.wrapping_add(load_bias).to_le_bytes());
+        }
+    }
 }
 
 impl<S: OutputSink> NativeSyscallBridge<S> {
@@ -950,8 +1025,24 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 } else {
                     event.args[1]
                 };
-                let addr = memory.mmap_anonymous_private_topdown(mapped_len, MemPerm::rw())?;
-                if mapped_elf {
+                let requested_len = event.args[1]
+                    .checked_add(4095)
+                    .ok_or_else(|| DaotiError::Other("mmap 长度对齐溢出".into()))?
+                    / 4096
+                    * 4096;
+                let backing_len = if event.args[0] == 0 {
+                    mapped_len
+                } else {
+                    requested_len
+                };
+                let addr = if event.args[0] != 0 {
+                    let requested_addr = event.args[0];
+                    memory.mmap_fixed_replace(requested_addr, requested_len, MemPerm::rw())?;
+                    requested_addr
+                } else {
+                    memory.mmap_anonymous_private_topdown(backing_len, MemPerm::rw())?
+                };
+                if mapped_elf && offset == 0 {
                     let info = super::parse_elf_from_bytes(bytes)?;
                     for segment in info.segments.iter().filter(|segment| segment.type_ == 1) {
                         let segment_start = usize::try_from(segment.offset)
@@ -983,7 +1074,17 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                         let image_addr = addr
                             .checked_add(vaddr)
                             .ok_or_else(|| DaotiError::Other("ELF PT_TLS 地址溢出".into()))?;
-                        let image = memory.read(image_addr, filesz)?.to_vec();
+                        let mut image = memory.read(image_addr, filesz)?.to_vec();
+                        let info = super::parse_elf_from_bytes(bytes)?;
+                        let load_ranges = info
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.type_ == 1)
+                            .map(|segment| {
+                                (segment.vaddr, segment.vaddr.saturating_add(segment.memsz))
+                            })
+                            .collect::<Vec<_>>();
+                        relocate_tls_image_internal_pointers(&mut image, addr, &load_ranges);
                         if std::env::var_os("DAOTI_TRACE_RELOCATIONS").is_some() {
                             eprintln!(
                                 "TRACE runtime-reloc tls-image addr=0x{image_addr:x} filesz=0x{filesz:x} memsz=0x{memsz:x} align={align} head={:02x?}",
@@ -998,16 +1099,64 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                     }
                     // __sbrk 通过 __curbrk 指针保存用户态 brk；fd-mmap 副本没有
                     // 真实内核初始化副作用，因此必须与 bridge 当前 brk 同步初值。
-                    memory.write(addr + 0x222218, &self.current_brk.to_le_bytes())?;
-                    if std::env::var_os("DAOTI_TRACE_RELOCATIONS").is_some() {
-                        eprintln!(
-                            "TRACE runtime-reloc curbrk-init addr=0x{:x} value=0x{:x}",
-                            addr + 0x222218,
-                            self.current_brk
-                        );
+                    if let Some(curbrk) = relocs.curbrk {
+                        memory.write(curbrk, &self.current_brk.to_le_bytes())?;
+                        if std::env::var_os("DAOTI_TRACE_RELOCATIONS").is_some() {
+                            eprintln!(
+                                "TRACE runtime-reloc curbrk-init addr=0x{curbrk:x} value=0x{:x}",
+                                self.current_brk
+                            );
+                        }
                     }
                 } else if offset < copy_end {
                     memory.write(addr, &bytes[offset..copy_end])?;
+                    // MAP_FIXED 分段覆盖会恢复文件中的 raw TLS/GOT 值；分段写入完成后
+                    // 重新按同一 load bias 应用重定位，保持后续 glibc 读取到运行时地址。
+                    if mapped_elf {
+                        let info = super::parse_elf_from_bytes(bytes)?;
+                        if let Some(segment) = info
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.type_ == 1)
+                            .find(|segment| {
+                                segment.offset / 4096 * 4096 == (offset as u64) / 4096 * 4096
+                            })
+                        {
+                            let bias = event.args[0]
+                                .checked_sub(segment.vaddr / 4096 * 4096)
+                                .ok_or_else(|| {
+                                    DaotiError::Other("ELF load bias 反推下溢".into())
+                                })?;
+                            let relocs = apply_elf_runtime_relocations(memory, bytes, bias)?;
+                            if let Some((vaddr, filesz, memsz, align)) = relocs.tls {
+                                let image_addr = bias.checked_add(vaddr).ok_or_else(|| {
+                                    DaotiError::Other("ELF PT_TLS 地址溢出".into())
+                                })?;
+                                let mut image = memory.read(image_addr, filesz)?.to_vec();
+                                let load_ranges = info
+                                    .segments
+                                    .iter()
+                                    .filter(|segment| segment.type_ == 1)
+                                    .map(|segment| {
+                                        (segment.vaddr, segment.vaddr.saturating_add(segment.memsz))
+                                    })
+                                    .collect::<Vec<_>>();
+                                relocate_tls_image_internal_pointers(
+                                    &mut image,
+                                    bias,
+                                    &load_ranges,
+                                );
+                                self.elf_tls = Some(ElfTlsImage {
+                                    image,
+                                    memsz,
+                                    align,
+                                });
+                            }
+                            if let Some(curbrk) = relocs.curbrk {
+                                memory.write(curbrk, &self.current_brk.to_le_bytes())?;
+                            }
+                        }
+                    }
                 }
                 if !mapped_elf && requested_perm != MemPerm::rw() {
                     let protect_len = event.args[1]
@@ -1054,8 +1203,18 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 return Err(DaotiError::Other("mmap 保护标志无效".into()));
             }
             let perm = MemPerm::new(prot & 0x1 != 0, prot & 0x2 != 0, prot & 0x4 != 0);
-            let anon_addr = memory
-                .mmap_anonymous_private_topdown(event.args[1], perm)
+            let anon_addr = if event.args[0] != 0 {
+                let requested_len = event.args[1]
+                    .checked_add(4095)
+                    .ok_or_else(|| DaotiError::Other("匿名 mmap 长度对齐溢出".into()))?
+                    / 4096
+                    * 4096;
+                memory
+                    .mmap_fixed_replace(event.args[0], requested_len, perm)
+                    .map(|_| event.args[0])
+            } else {
+                memory.mmap_anonymous_private_topdown(event.args[1], perm)
+            }
                 .map(|addr| {
                     if std::env::var_os("DAOTI_TRACE_RUNTIME").is_some() {
                         let within_ptload = self.main_ptload_ranges.iter().any(|(s, e)| addr >= *s && addr < *e);

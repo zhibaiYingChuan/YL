@@ -504,6 +504,7 @@ impl LinuxEmulationHandler {
             39 => "getpid",
             89 => "readlink",
             117 => "raise",
+            267 => "readlinkat",
             186 => "gettid",
             200 => "tkill",
             203 => "sched_setaffinity",
@@ -712,6 +713,44 @@ impl SyscallHandler for LinuxEmulationHandler {
                 eprintln!("TRACE linux-emulation-syscall exit nr=1 ret={ret}");
             }
             return Ok(ret);
+        }
+        if event.nr == 267 {
+            // readlinkat(dirfd, pathname, buf, bufsiz)
+            // glibc 早期用 readlinkat(AT_FDCWD, "/proc/self/exe", ...) 定位 rtld 目录；
+            // 返回失败时 glibc 有官方 fallback（_rtld_global_ro+0x2c0 字符串），
+            // 因此宿主无法解析时返回 -ENOENT 属于真实内核语义，不违反契约。
+            if event.args[0] as i64 != -100 {
+                return Ok(-9); // -EBADF：仅支持 AT_FDCWD（glibc 启动只使用该形式）
+            }
+            let path_addr = event.args[1];
+            let buf_addr = event.args[2];
+            let bufsiz = usize::try_from(event.args[3])
+                .map_err(|_| DaotiError::Other("readlinkat bufsiz 超出平台范围".into()))?;
+            let Some(path) = read_c_string_lossy(memory, path_addr, 4096) else {
+                return Ok(-14); // -EFAULT：guest 路径不可读
+            };
+            match std::fs::read_link(&path) {
+                Ok(target) => {
+                    let bytes = target.to_string_lossy().as_bytes().to_vec();
+                    let n = bytes.len().min(bufsiz);
+                    memory.write(buf_addr, &bytes[..n])?;
+                    if std::env::var_os("DAOTI_TRACE_SYSCALLS").is_some() {
+                        eprintln!(
+                            "TRACE linux-emulation-syscall readlinkat path={path:?} -> {:?} n={n}",
+                            target.to_string_lossy()
+                        );
+                    }
+                    return Ok(n as i64);
+                }
+                Err(host_err) => {
+                    if std::env::var_os("DAOTI_TRACE_SYSCALLS").is_some() {
+                        eprintln!(
+                            "TRACE linux-emulation-syscall readlinkat path={path:?} host_err={host_err} ret=-ENOENT"
+                        );
+                    }
+                    return Ok(-2); // -ENOENT：宿主 FS 不可解析（如 /proc 在 Windows 宿主缺失）
+                }
+            }
         }
         if event.nr == 231 && std::env::var_os("DAOTI_TRACE_EXIT_GROUP").is_some() {
             eprintln!(
