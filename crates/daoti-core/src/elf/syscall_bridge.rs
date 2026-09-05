@@ -904,9 +904,14 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             return Ok(fd as i64);
         }
         if event.nr == SYS_CLOSE {
-            // 文件内容已被受控桥接器载入内存；保留快照，使 close 后的 mmap
-            // 仍符合 Linux 的文件映射语义。
-            return Ok(0);
+            // 关闭 fd：文件内容已被受控桥接器载入内存（mmap 复制语义），
+            // 但仍需校验 fd 真实存在（stdin/stdout/stderr 0..2 恒有效），
+            // 未知 fd 返回 -EBADF，与 Linux 语义一致。
+            let fd = event.args[0] as i32;
+            if self.files.contains_key(&fd) || self.dirs.contains_key(&fd) || fd < 3 {
+                return Ok(0);
+            }
+            return Ok(-9); // -EBADF
         }
         if event.nr == SYS_LSEEK {
             // lseek(fd, offset, whence)：仅维护已打开的文件快照偏移，
@@ -1009,6 +1014,13 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             } else {
                 *offset
             };
+            // start 越过 EOF 时返回 0（Linux 语义），避免切片逆序越界。
+            if start >= bytes.len() {
+                if event.nr == SYS_READ {
+                    *offset = bytes.len();
+                }
+                return Ok(0);
+            }
             let end = start.saturating_add(count).min(bytes.len());
             memory.write(event.args[1], &bytes[start..end])?;
             let read = end - start;
@@ -1024,10 +1036,21 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 event.args[2]
             };
             let mut stat = [0u8; 144];
-            // Linux x86_64 struct stat：填充 glibc 读取的类型、大小和块信息。
+            // Linux x86_64 struct stat 布局（st_dev 0/st_ino 8/st_nlink 16/st_mode 24/
+            // st_uid 28/st_gid 32/st_rdev 40/st_size 48/st_blksize 56/st_blocks 64）。
+            stat[0..8].copy_from_slice(&1u64.to_le_bytes());
             stat[8..16].copy_from_slice(&1u64.to_le_bytes());
-            stat[16..20].copy_from_slice(&0x8000u32.to_le_bytes());
-            stat[20..24].copy_from_slice(&1u32.to_le_bytes());
+            stat[16..24].copy_from_slice(&1u64.to_le_bytes());
+            // 目录句柄返回 S_IFDIR(0o040000) | 0755；普通文件保持 S_IFREG(0o100000)。
+            let is_dir_fd = self.dirs.contains_key(&(event.args[0] as i32));
+            let mode = if is_dir_fd {
+                0o040000u32 | 0o755
+            } else {
+                0o100000u32 | 0o644
+            };
+            stat[24..28].copy_from_slice(&mode.to_le_bytes());
+            stat[28..32].copy_from_slice(&1000u32.to_le_bytes());
+            stat[32..36].copy_from_slice(&1000u32.to_le_bytes());
             if event.nr == SYS_NEWFSTATAT {
                 if let Some((bytes, _)) = self.files.get(&(event.args[0] as i32)) {
                     stat[48..56].copy_from_slice(&(bytes.len() as i64).to_le_bytes());
@@ -1576,6 +1599,11 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 .dirs
                 .get_mut(&fd)
                 .ok_or_else(|| DaotiError::Other("无效目录文件描述符".into()))?;
+            // count 小于最小对齐条目（24，供 "." 项：19 头部 + 1 名称 + 1 NUL，对齐 8）
+            // 时返回 -EINVAL；真实内核同样拒绝过小缓冲区。
+            if count < 24 {
+                return Ok(-22); // -EINVAL
+            }
             let mut entries: Vec<(Vec<u8>, u8)> =
                 vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
             let mut children: Vec<(Vec<u8>, u8)> = std::fs::read_dir(dir_path)
@@ -2086,6 +2114,76 @@ mod tests {
         assert_eq!(type_of.get("a.txt"), Some(&8)); // DT_REG
         assert_eq!(type_of.get("b"), Some(&8));
         assert_eq!(type_of.get("sub"), Some(&4)); // DT_DIR
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fstat_reports_directory_mode_for_dir_fd() {
+        let root = std::env::temp_dir().join(format!("daoti-fstat-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b".\0").unwrap();
+        let open =
+            RuntimeSyscallEvent::enter(SYS_OPENAT, "openat", [-100i64 as u64, 0x1100, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&open, &mut memory).unwrap() as i32;
+        let stat = RuntimeSyscallEvent::enter(SYS_FSTAT, "fstat", [fd as u64, 0x1200, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&stat, &mut memory).unwrap(), 0);
+        // struct stat：st_mode 位于偏移 24；S_IFDIR=0o040000
+        let mode = u32::from_le_bytes(memory.read(0x1218, 4).unwrap().try_into().unwrap());
+        assert_eq!(mode & 0o170000, 0o040000);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn close_returns_ebadf_for_unknown_descriptor() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        bridge.files.insert(9, (b"data".to_vec(), 0));
+        let mut memory = memory();
+        let known = RuntimeSyscallEvent::enter(SYS_CLOSE, "close", [9, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&known, &mut memory).unwrap(), 0);
+        let unknown = RuntimeSyscallEvent::enter(SYS_CLOSE, "close", [1234, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&unknown, &mut memory).unwrap(),
+            -9
+        );
+    }
+
+    #[test]
+    fn lseek_past_eof_then_read_returns_zero() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        bridge.files.insert(9, (b"abcdef".to_vec(), 0));
+        let mut memory = memory();
+        // SEEK_END(2) + 8 → 14，越过 6 字节 EOF
+        let seek = RuntimeSyscallEvent::enter(SYS_LSEEK, "lseek", [9, 8, 2, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&seek, &mut memory).unwrap(), 14);
+        // EOF 之外 read 返回 0（不报错、不越界写）
+        let read = RuntimeSyscallEvent::enter(SYS_READ, "read", [9, 0x1100, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&read, &mut memory).unwrap(), 0);
+    }
+
+    #[test]
+    fn getdents64_rejects_tiny_buffer() {
+        let root = std::env::temp_dir().join(format!("daoti-dents-tiny-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b".\0").unwrap();
+        let open = RuntimeSyscallEvent::enter(
+            SYS_OPENAT,
+            "openat",
+            [-100i64 as u64, 0x1100, 0x10000, 0, 0, 0],
+        );
+        let fd = bridge.handle_with_memory(&open, &mut memory).unwrap() as i32;
+        // count 过小（< 最小对齐条目 24）返回 -EINVAL，而不是 0（0 会被误判为读完）
+        let tiny = RuntimeSyscallEvent::enter(
+            SYS_GETDENTS64,
+            "getdents64",
+            [fd as u64, 0x1300, 8, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&tiny, &mut memory).unwrap(), -22);
         let _ = std::fs::remove_dir_all(&root);
     }
 
