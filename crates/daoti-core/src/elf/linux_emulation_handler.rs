@@ -498,6 +498,7 @@ impl LinuxEmulationHandler {
             9 => "mmap",
             10 => "mprotect",
             12 => "brk",
+            25 => "mremap",
             11 => "munmap",
             26 => "msync",
             27 => "mincore",

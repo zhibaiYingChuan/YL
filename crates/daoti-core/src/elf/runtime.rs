@@ -397,6 +397,132 @@ impl MemoryModel {
         Ok(())
     }
 
+    /// Linux mremap 语义（受限但真实）：原地收缩/扩展、MAYMOVE 移动、FIXED 指定新址。
+    /// 返回新地址；错误消息编码 errno 关键词供桥接层映射（未映射=EFAULT/空间不足=ENOMEM/参数无效=EINVAL）。
+    pub fn remap(
+        &mut self,
+        old_addr: u64,
+        old_size: u64,
+        new_size: u64,
+        flags: u64,
+        fixed_addr: Option<u64>,
+    ) -> Result<u64, DaotiError> {
+        const MREMAP_MAYMOVE: u64 = 1;
+        const MREMAP_FIXED: u64 = 2;
+        let page_aligned = |value: u64| value.is_multiple_of(4096);
+        if !page_aligned(old_addr)
+            || !page_aligned(old_size)
+            || new_size == 0
+            || !page_aligned(new_size)
+        {
+            return Err(DaotiError::Other("mremap 参数无效".into()));
+        }
+        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
+            return Err(DaotiError::Other("mremap 参数无效".into()));
+        }
+        if flags & MREMAP_FIXED != 0 && fixed_addr.is_none() {
+            return Err(DaotiError::Other("mremap 参数无效".into()));
+        }
+        let old_end = old_addr
+            .checked_add(old_size)
+            .ok_or_else(|| DaotiError::Other("mremap 范围溢出".into()))?;
+        let covered: u64 = self
+            .regions
+            .iter()
+            .filter(|region| {
+                region.base < old_end && old_addr < region.base + region.bytes.len() as u64
+            })
+            .map(|region| {
+                let start = old_addr.max(region.base);
+                let finish = old_end.min(region.base + region.bytes.len() as u64);
+                finish - start
+            })
+            .sum();
+        if covered < old_size {
+            return Err(DaotiError::Other("mremap 未映射".into()));
+        }
+        let fixed = flags & MREMAP_FIXED != 0;
+        let maymove = flags & MREMAP_MAYMOVE != 0;
+
+        if new_size == old_size && !fixed {
+            return Ok(old_addr);
+        }
+        // FIXED：先卸载目标区，再按目标地址重建并搬运内容。
+        if fixed {
+            let target = fixed_addr.expect("FIXED 已校验存在");
+            if !page_aligned(target)
+                || target
+                    .checked_add(new_size)
+                    .is_none_or(|end| end > self.max_addr)
+            {
+                return Err(DaotiError::Other("mremap 参数无效".into()));
+            }
+            let data = self.read_range(old_addr, old_size.min(new_size))?;
+            self.unmap(target, new_size)?;
+            self.mmap_fixed_replace(target, new_size, MemPerm::rw())?;
+            self.write(target, &data)?;
+            self.unmap(old_addr, old_size)?;
+            return Ok(target);
+        }
+        // 收缩：原地卸载尾部。
+        if new_size < old_size {
+            self.unmap(old_addr + new_size, old_size - new_size)?;
+            return Ok(old_addr);
+        }
+        // 扩展：若 [old_end, old_end+增量) 无 region 且不越界则原地扩张。
+        let new_end = old_addr
+            .checked_add(new_size)
+            .ok_or_else(|| DaotiError::Other("mremap 范围溢出".into()))?;
+        let in_place = new_end <= self.max_addr
+            && !self.regions.iter().any(|region| {
+                region.base < new_end && old_end < region.base + region.bytes.len() as u64
+            });
+        if in_place {
+            let index = self.regions.iter().position(|region| {
+                old_addr >= region.base && old_end == region.base + region.bytes.len() as u64
+            });
+            if let Some(index) = index {
+                let region = &mut self.regions[index];
+                region
+                    .bytes
+                    .resize(region.bytes.len() + (new_size - old_size) as usize, 0);
+                return Ok(old_addr);
+            }
+        }
+        if !maymove {
+            return Err(DaotiError::Other("mremap 空间不足".into()));
+        }
+        // MAYMOVE：读取旧内容，分配新区间，写入后释放旧区间。
+        let data = self.read_range(old_addr, old_size)?;
+        let new_addr = self.mmap_anonymous_private_topdown(new_size, MemPerm::rw())?;
+        self.write(new_addr, &data)?;
+        self.unmap(old_addr, old_size)?;
+        Ok(new_addr)
+    }
+
+    /// 读取 [addr, addr+len) 跨 region 拼接内容（供 mremap 数据搬迁）。
+    pub fn read_range(&self, addr: u64, len: u64) -> Result<Vec<u8>, DaotiError> {
+        let end = addr
+            .checked_add(len)
+            .ok_or_else(|| DaotiError::Other("read_range 范围溢出".into()))?;
+        let mut out = Vec::with_capacity(len as usize);
+        for region in &self.regions {
+            let region_end = region.base + region.bytes.len() as u64;
+            if region_end <= addr || region.base >= end {
+                continue;
+            }
+            let start = addr.max(region.base);
+            let stop = end.min(region_end);
+            let offset = (start - region.base) as usize;
+            let count = (stop - start) as usize;
+            out.extend_from_slice(&region.bytes[offset..offset + count]);
+        }
+        if out.len() as u64 != len {
+            return Err(DaotiError::Other("read_range 目标未映射".into()));
+        }
+        Ok(out)
+    }
+
     pub fn mprotect(&mut self, addr: u64, len: u64, perm: MemPerm) -> Result<(), DaotiError> {
         if len == 0 || !addr.is_multiple_of(4096) {
             return Err(DaotiError::Other("mprotect 地址或长度无效".into()));

@@ -33,6 +33,9 @@ pub const SYS_MLOCK: u64 = 149;
 pub const SYS_MUNLOCK: u64 = 150;
 pub const SYS_MLOCKALL: u64 = 151;
 pub const SYS_MUNLOCKALL: u64 = 152;
+pub const SYS_MREMAP: u64 = 25;
+pub const MREMAP_MAYMOVE: u64 = 1;
+pub const MREMAP_FIXED: u64 = 2;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_BRK: u64 = 12;
@@ -1702,6 +1705,35 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 .map(|_| 0)
                 .map_err(|_| DaotiError::Other("munmap 失败".into()));
         }
+        if event.nr == SYS_MREMAP {
+            // mremap(old_addr, old_size, new_size, flags[, new_addr])
+            let flags = event.args[3];
+            let fixed_addr = if flags & MREMAP_FIXED != 0 {
+                Some(event.args[4])
+            } else {
+                None
+            };
+            let result = memory.remap(
+                event.args[0],
+                event.args[1],
+                event.args[2],
+                flags,
+                fixed_addr,
+            );
+            return match result {
+                Ok(address) => Ok(address as i64),
+                Err(error) => {
+                    let message = format!("{error}");
+                    if message.contains("未映射") {
+                        Ok(-14) // -EFAULT
+                    } else if message.contains("空间不足") {
+                        Ok(-12) // -ENOMEM
+                    } else {
+                        Ok(-22) // -EINVAL
+                    }
+                }
+            };
+        }
         if event.nr == SYS_MSYNC {
             // msync(addr, len, flags)：MS_ASYNC=1 / MS_INVALIDATE=2 / MS_SYNC=4。
             // 快照式内存已常驻且无宿主写回需求，映射存在即成功。
@@ -2420,6 +2452,163 @@ mod tests {
         assert_eq!(
             bridge.handle_with_memory(&all_clear, &mut memory).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn mremap_grows_in_place_when_space_available() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x2000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        // 原地扩展 [0x2000,0x3000) → [0x2000,0x4000)：上方无 region 且不越界
+        let event =
+            RuntimeSyscallEvent::enter(SYS_MREMAP, "mremap", [0x2000, 0x1000, 0x2000, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&event, &mut memory).unwrap(),
+            0x2000
+        );
+        assert!(memory.write(0x3000, &[0x5a]).is_ok());
+        assert_eq!(memory.read(0x3000, 1).unwrap(), [0x5a]);
+    }
+
+    #[test]
+    fn mremap_shrinks_in_place_releasing_tail() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x2000,
+                MemPerm::rw(),
+                vec![0; 0x2000],
+            ))
+            .unwrap();
+        // 收缩 [0x2000,0x4000) → [0x2000,0x3000)：返回原地址，尾部释放
+        let event =
+            RuntimeSyscallEvent::enter(SYS_MREMAP, "mremap", [0x2000, 0x2000, 0x1000, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&event, &mut memory).unwrap(),
+            0x2000
+        );
+        assert!(memory.read(0x2000, 1).is_ok());
+        assert!(memory.read(0x3000, 1).is_err());
+    }
+
+    #[test]
+    fn mremap_moves_with_maymove_preserving_content() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        // 阻碍原地扩展的占位 region + 待移动 region
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x3000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        memory
+            .add_region(MemoryRegion::with_data(0x2000, MemPerm::rw(), {
+                let mut bytes = vec![0u8; 0x1000];
+                bytes[..7].copy_from_slice(b"payload");
+                bytes
+            }))
+            .unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_MREMAP,
+            "mremap",
+            [0x2000, 0x1000, 0x2000, MREMAP_MAYMOVE, 0, 0],
+        );
+        let new_addr = bridge.handle_with_memory(&event, &mut memory).unwrap() as u64;
+        assert_ne!(new_addr, 0x2000);
+        // 新地址内容保留、旧地址释放
+        assert_eq!(memory.read(new_addr, 7).unwrap(), b"payload");
+        assert!(memory.read(0x2000, 1).is_err());
+    }
+
+    #[test]
+    fn mremap_without_maymove_returns_enomem_when_blocked() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x3000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x2000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        // 无法原地扩展且未指定 MAYMOVE → -ENOMEM
+        let event =
+            RuntimeSyscallEvent::enter(SYS_MREMAP, "mremap", [0x2000, 0x1000, 0x2000, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -12);
+    }
+
+    #[test]
+    fn mremap_fixed_places_at_hint_and_releases_old() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(0x2000, MemPerm::rw(), {
+                let mut bytes = vec![0u8; 0x1000];
+                bytes[..6].copy_from_slice(b"hello!");
+                bytes
+            }))
+            .unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_MREMAP,
+            "mremap",
+            [
+                0x2000,
+                0x1000,
+                0x1000,
+                MREMAP_MAYMOVE | MREMAP_FIXED,
+                0x5000,
+                0,
+            ],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&event, &mut memory).unwrap(),
+            0x5000
+        );
+        assert_eq!(memory.read(0x5000, 6).unwrap(), b"hello!");
+        assert!(memory.read(0x2000, 1).is_err());
+    }
+
+    #[test]
+    fn mremap_rejects_invalid_or_unmapped_args() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x2000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        // 非页对齐长度 → -EINVAL
+        let unaligned =
+            RuntimeSyscallEvent::enter(SYS_MREMAP, "mremap", [0x2000, 0x500, 0x1000, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&unaligned, &mut memory).unwrap(),
+            -22
+        );
+        // 未映射起始地址 → -EFAULT
+        let unmapped =
+            RuntimeSyscallEvent::enter(SYS_MREMAP, "mremap", [0x6000, 0x1000, 0x1000, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&unmapped, &mut memory).unwrap(),
+            -14
         );
     }
 
