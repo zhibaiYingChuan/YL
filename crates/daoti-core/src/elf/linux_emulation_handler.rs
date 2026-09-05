@@ -498,6 +498,13 @@ impl LinuxEmulationHandler {
             9 => "mmap",
             10 => "mprotect",
             12 => "brk",
+            11 => "munmap",
+            26 => "msync",
+            27 => "mincore",
+            149 => "mlock",
+            150 => "munlock",
+            151 => "mlockall",
+            152 => "munlockall",
             158 => "arch_prctl",
             60 => "exit",
             231 => "exit_group",
@@ -784,6 +791,14 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 8
                 | 9
                 | 10
+                | 12
+                | 11
+                | 26
+                | 27
+                | 149
+                | 150
+                | 151
+                | 152
                 | 72
                 | 137
                 | 138
@@ -794,7 +809,6 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 80
                 | 258
                 | 217
-                | 12
                 | 13
                 | 14
                 | 16

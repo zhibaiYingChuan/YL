@@ -26,6 +26,13 @@ pub const SYS_FSYNC: u64 = 74;
 pub const SYS_FTRUNCATE: u64 = 77;
 pub const SYS_MKDIRAT: u64 = 258;
 pub const SYS_GETDENTS64: u64 = 217;
+pub const SYS_MUNMAP: u64 = 11;
+pub const SYS_MSYNC: u64 = 26;
+pub const SYS_MINICORE: u64 = 27;
+pub const SYS_MLOCK: u64 = 149;
+pub const SYS_MUNLOCK: u64 = 150;
+pub const SYS_MLOCKALL: u64 = 151;
+pub const SYS_MUNLOCKALL: u64 = 152;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_BRK: u64 = 12;
@@ -810,6 +817,36 @@ impl<S: OutputSink> SyscallHandler for NativeSyscallBridge<S> {
     fn fs_base(&self) -> Option<u64> {
         self.fs_base
     }
+}
+
+/// 判断 [addr, addr+len) 与任意 region 有交集（部分映射）。
+fn memory_range_partially_mapped(memory: &MemoryModel, addr: u64, len: u64) -> bool {
+    let end = addr.saturating_add(len);
+    memory
+        .regions
+        .iter()
+        .any(|region| addr < region.base + region.bytes.len() as u64 && region.base < end)
+}
+
+/// 判断 [addr, addr+len) 是否被 region 完整覆盖（无空洞）。
+fn memory_range_fully_mapped(memory: &MemoryModel, addr: u64, len: u64) -> bool {
+    let end = addr.saturating_add(len);
+    let covered: u64 = memory
+        .regions
+        .iter()
+        .filter(|region| region.base < end && addr < region.base + region.bytes.len() as u64)
+        .map(|region| {
+            let start = addr.max(region.base);
+            let finish = end.min(region.base + region.bytes.len() as u64);
+            finish - start
+        })
+        .sum();
+    covered >= len
+}
+
+/// Linux munmap/msync 等内存管理调用的宿主地址必须页对齐。
+fn is_page_aligned(value: u64) -> bool {
+    value.is_multiple_of(4096)
 }
 
 impl<S: OutputSink> NativeSyscallBridge<S> {
@@ -1653,6 +1690,76 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             *cursor = index;
             return Ok(written as i64);
         }
+        if event.nr == SYS_MUNMAP {
+            // munmap(addr, len)：卸载映射区间，addr/len 必须页对齐。
+            let addr = event.args[0];
+            let len = event.args[1];
+            if !is_page_aligned(addr) || !is_page_aligned(len) {
+                return Ok(-22); // -EINVAL
+            }
+            return memory
+                .unmap(addr, len)
+                .map(|_| 0)
+                .map_err(|_| DaotiError::Other("munmap 失败".into()));
+        }
+        if event.nr == SYS_MSYNC {
+            // msync(addr, len, flags)：MS_ASYNC=1 / MS_INVALIDATE=2 / MS_SYNC=4。
+            // 快照式内存已常驻且无宿主写回需求，映射存在即成功。
+            const MS_ASYNC: u64 = 1;
+            const MS_INVALIDATE: u64 = 2;
+            const MS_SYNC: u64 = 4;
+            let addr = event.args[0];
+            let len = event.args[1];
+            let flags = event.args[2];
+            if !is_page_aligned(addr) || !is_page_aligned(len) {
+                return Ok(-22); // -EINVAL
+            }
+            if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 {
+                return Ok(-22); // -EINVAL
+            }
+            if !memory_range_partially_mapped(memory, addr, len) {
+                return Ok(-12); // -ENOMEM：范围内无任何映射
+            }
+            return Ok(0);
+        }
+        if event.nr == SYS_MINICORE {
+            // mincore(addr, len, vec)：每页一个字节，最低位 1 = 驻留。
+            let addr = event.args[0];
+            let len = event.args[1];
+            let vec = event.args[2];
+            if !is_page_aligned(addr) {
+                return Ok(-22); // -EINVAL
+            }
+            if !memory_range_fully_mapped(memory, addr, len) {
+                return Ok(-12); // -ENOMEM
+            }
+            let page_count = len.div_ceil(4096);
+            memory.write(vec, &vec![0xff; page_count as usize])?;
+            return Ok(0);
+        }
+        if event.nr == SYS_MLOCK || event.nr == SYS_MUNLOCK {
+            // mlock/munlock(addr, len)：页对齐 + 范围内必须有映射，否则 -ENOMEM。
+            let addr = event.args[0];
+            let len = event.args[1];
+            if !is_page_aligned(addr) {
+                return Ok(-22); // -EINVAL
+            }
+            if !memory_range_partially_mapped(memory, addr, len) {
+                return Ok(-12); // -ENOMEM
+            }
+            return Ok(0);
+        }
+        if event.nr == SYS_MLOCKALL {
+            // mlockall(flags)：MCL_CURRENT=1 / MCL_FUTURE=2，未知位拒绝。
+            let flags = event.args[0];
+            if flags & !(1 | 2) != 0 {
+                return Ok(-22); // -EINVAL
+            }
+            return Ok(0);
+        }
+        if event.nr == SYS_MUNLOCKALL {
+            return Ok(0);
+        }
         if event.nr == SYS_BRK {
             let raw = self.current_brk;
             let new_brk = event.args[0];
@@ -2185,6 +2292,135 @@ mod tests {
         );
         assert_eq!(bridge.handle_with_memory(&tiny, &mut memory).unwrap(), -22);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn munmap_releases_region_and_isolates_split() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        let map = RuntimeSyscallEvent::enter(
+            SYS_MMAP,
+            "mmap",
+            [0, 0x3000, 0x3, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0],
+        );
+        let base = bridge.handle_with_memory(&map, &mut memory).unwrap() as u64;
+        assert!(memory.write(base, &[1]).is_ok());
+        assert!(memory.write(base + 0x2000, &[2]).is_ok());
+        // 卸载中间页 [base+0x1000, base+0x2000)
+        let unmap =
+            RuntimeSyscallEvent::enter(SYS_MUNMAP, "munmap", [base + 0x1000, 0x1000, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&unmap, &mut memory).unwrap(), 0);
+        // 前缀/后缀仍可访问，中间页已不可访问
+        assert!(memory.read(base, 1).is_ok());
+        assert!(memory.read(base + 0x2000, 1).is_ok());
+        assert!(memory.read(base + 0x1000, 1).is_err());
+        assert!(memory.write(base + 0x1000, &[3]).is_err());
+    }
+
+    #[test]
+    fn munmap_unmapped_range_silently_succeeds() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        // [0x3000, 0x4000) 从未映射：munmap 静默成功返回 0
+        let event = RuntimeSyscallEvent::enter(SYS_MUNMAP, "munmap", [0x3000, 0x1000, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        // 非法参数：长度非页对齐 → -EINVAL
+        let invalid = RuntimeSyscallEvent::enter(SYS_MUNMAP, "munmap", [0x3000, 0x500, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&invalid, &mut memory).unwrap(),
+            -22
+        );
+    }
+
+    #[test]
+    fn msync_accepts_mapped_range_and_validates_flags() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x5000);
+        let map = RuntimeSyscallEvent::enter(
+            SYS_MMAP,
+            "mmap",
+            [0, 0x1000, 0x3, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0],
+        );
+        let base = bridge.handle_with_memory(&map, &mut memory).unwrap() as u64;
+        // MS_ASYNC=1 / MS_SYNC=4 对已映射私有匿名页返回 0
+        for flags in [1u64, 4] {
+            let event =
+                RuntimeSyscallEvent::enter(SYS_MSYNC, "msync", [base, 0x1000, flags, 0, 0, 0]);
+            assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        }
+        // 非法 flags → -EINVAL
+        let bad = RuntimeSyscallEvent::enter(SYS_MSYNC, "msync", [base, 0x1000, 0x100, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -22);
+        // 未映射范围 → -ENOMEM
+        let missing = RuntimeSyscallEvent::enter(SYS_MSYNC, "msync", [0x3000, 0x1000, 1, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&missing, &mut memory).unwrap(),
+            -12
+        );
+    }
+
+    #[test]
+    fn mincore_reports_all_resident_pages() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        let map = RuntimeSyscallEvent::enter(
+            SYS_MMAP,
+            "mmap",
+            [0, 0x2000, 0x3, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0],
+        );
+        let base = bridge.handle_with_memory(&map, &mut memory).unwrap() as u64;
+        // mincore(base, 0x2000, vec)：2 页全部驻留 → vec 两字节最低位均为 1
+        let event =
+            RuntimeSyscallEvent::enter(SYS_MINICORE, "mincore", [base, 0x2000, 0x1100, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        assert_eq!(memory.read(0x1100, 2).unwrap(), [0xff, 0xff]);
+    }
+
+    #[test]
+    fn mlock_family_validates_arguments() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x5000);
+        let map = RuntimeSyscallEvent::enter(
+            SYS_MMAP,
+            "mmap",
+            [0, 0x1000, 0x3, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0],
+        );
+        let base = bridge.handle_with_memory(&map, &mut memory).unwrap() as u64;
+        // mlock / munlock：已映射页返回 0；未映射页返回 -ENOMEM
+        let lock = RuntimeSyscallEvent::enter(SYS_MLOCK, "mlock", [base, 0x1000, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&lock, &mut memory).unwrap(), 0);
+        let unlock = RuntimeSyscallEvent::enter(SYS_MUNLOCK, "munlock", [base, 0x1000, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&unlock, &mut memory).unwrap(), 0);
+        let missing = RuntimeSyscallEvent::enter(SYS_MLOCK, "mlock", [0x3000, 0x1000, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&missing, &mut memory).unwrap(),
+            -12
+        );
+        // mlockall：MCL_CURRENT(1)|MCL_FUTURE(2) 合法；未知位返回 -EINVAL
+        let all = RuntimeSyscallEvent::enter(SYS_MLOCKALL, "mlockall", [3, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&all, &mut memory).unwrap(), 0);
+        let bad = RuntimeSyscallEvent::enter(SYS_MLOCKALL, "mlockall", [0x100, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -22);
+        let all_clear =
+            RuntimeSyscallEvent::enter(SYS_MUNLOCKALL, "munlockall", [0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&all_clear, &mut memory).unwrap(),
+            0
+        );
     }
 
     #[test]

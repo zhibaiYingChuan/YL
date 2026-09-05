@@ -356,6 +356,47 @@ impl MemoryModel {
         Ok(())
     }
 
+    /// Linux munmap 语义：卸载 addr..addr+len 覆盖的映射区间，重叠部分按前缀/
+    /// 后缀拆分保留；对完全未映射的地址静默成功。addr/len 必须页对齐。
+    pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), DaotiError> {
+        if len == 0 || !addr.is_multiple_of(4096) || !len.is_multiple_of(4096) {
+            return Err(DaotiError::Other("munmap 地址或长度无效".into()));
+        }
+        let end = addr
+            .checked_add(len)
+            .ok_or_else(|| DaotiError::Other("munmap 范围溢出".into()))?;
+        if end > self.max_addr {
+            return Err(DaotiError::Other("munmap 范围越界".into()));
+        }
+        let mut retained = Vec::with_capacity(self.regions.len());
+        for region in self.regions.drain(..) {
+            if region.end() <= addr || region.base >= end {
+                // 与卸载区间完全不相交，原样保留（含未映射区域 → 静默成功）。
+                retained.push(region);
+                continue;
+            }
+            if region.base < addr {
+                let prefix_len = (addr - region.base) as usize;
+                retained.push(MemoryRegion::with_data(
+                    region.base,
+                    region.perm,
+                    region.bytes[..prefix_len].to_vec(),
+                ));
+            }
+            if region.end() > end {
+                let suffix_start = (end - region.base) as usize;
+                retained.push(MemoryRegion::with_data(
+                    end,
+                    region.perm,
+                    region.bytes[suffix_start..].to_vec(),
+                ));
+            }
+        }
+        retained.sort_by_key(|region| region.base);
+        self.regions = retained;
+        Ok(())
+    }
+
     pub fn mprotect(&mut self, addr: u64, len: u64, perm: MemPerm) -> Result<(), DaotiError> {
         if len == 0 || !addr.is_multiple_of(4096) {
             return Err(DaotiError::Other("mprotect 地址或长度无效".into()));
