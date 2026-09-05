@@ -116,8 +116,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("daoti-engine-{}-{unique}.elf", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "daoti-engine-local-{}-{unique}.elf",
+            std::process::id()
+        ));
         let mut data = vec![0u8; 0x1000];
         data[0..4].copy_from_slice(b"\x7fELF");
         data[4] = 2;

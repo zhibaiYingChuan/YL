@@ -14,7 +14,12 @@ use crate::bilateral::network::BilateralLadderNetwork;
 use crate::codec::{Decoder, Encoder, SyscallCodec};
 
 pub const SYS_WRITE: u64 = 1;
+pub const SYS_LSEEK: u64 = 8;
+pub const SYS_FCNTL: u64 = 72;
 pub const SYS_ACCESS: u64 = 21;
+pub const SYS_STATFS: u64 = 137;
+pub const SYS_FSTATFS: u64 = 138;
+pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_BRK: u64 = 12;
@@ -833,6 +838,93 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             // 仍符合 Linux 的文件映射语义。
             return Ok(0);
         }
+        if event.nr == SYS_LSEEK {
+            // lseek(fd, offset, whence)：仅维护已打开的文件快照偏移，
+            // whence 支持 SEEK_SET=0 / SEEK_CUR=1 / SEEK_END=2，其余报 -EINVAL。
+            let fd = event.args[0] as i32;
+            let offset = event.args[1] as i64;
+            let whence = event.args[2];
+            let (bytes, cursor) = self
+                .files
+                .get_mut(&fd)
+                .ok_or_else(|| DaotiError::Other("无效文件描述符".into()))?;
+            let base = match whence {
+                0 => 0i64,
+                1 => *cursor as i64,
+                2 => bytes.len() as i64,
+                _ => return Ok(-22), // -EINVAL
+            };
+            let target = base
+                .checked_add(offset)
+                .ok_or_else(|| DaotiError::Other("lseek 偏移溢出".into()))?;
+            if target < 0 {
+                return Ok(-22); // -EINVAL：负偏移不可用
+            }
+            *cursor = target as usize;
+            return Ok(target);
+        }
+        if event.nr == SYS_FCNTL {
+            // fcntl(fd, cmd, arg)：只实现该仿真环境需要的最小命令集合，
+            // 未知命令明确返回 -EINVAL，不伪装成功。
+            let fd = event.args[0] as i32;
+            if !self.files.contains_key(&fd) {
+                return Ok(-9); // -EBADF
+            }
+            let cmd = event.args[1];
+            match cmd {
+                // F_GETFD=1：返回 close-on-exec 位（0 = 未设置）
+                1 => return Ok(0),
+                // F_GETFL=3：返回文件状态标志（O_RDONLY=0）
+                3 => return Ok(0),
+                // F_SETFD=2 / F_SETFL=4：接受但不额外维护状态位（快照天生只读）
+                2 | 4 => return Ok(0),
+                // F_GETLK=5：不应答锁，返回 -EINVAL
+                _ => return Ok(-22),
+            }
+        }
+        if event.nr == SYS_STATFS || event.nr == SYS_FSTATFS {
+            // statfs(path, &buf) / fstatfs(fd, &buf)：填充 Linux x86_64
+            // struct statfs 前 4 个成员，保证 libc 读取类型与块大小可用。
+            let buf_addr = event.args[1];
+            let mut statfs = [0u8; 96];
+            // f_type=0x794c7630 (daoti)、f_bsize=4096、f_blocks/f_bfree/f_bavail 足够包容。
+            statfs[0..8].copy_from_slice(&0x794c7630u64.to_le_bytes());
+            statfs[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            statfs[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+            statfs[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+            statfs[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+            memory.write(buf_addr, &statfs)?;
+            return Ok(0);
+        }
+        if event.nr == SYS_UNLINKAT {
+            // unlinkat(dirfd, pathname, flags)：仅在受控根目录内删除真实文件，
+            // AT_FDCWD(-100) 支持，其余 dirfd 报 -EBADF；flags 仅接受 0，否则 -EINVAL。
+            let dirfd = event.args[0] as i64;
+            if dirfd != -100 {
+                return Ok(-9); // -EBADF
+            }
+            let flags = event.args[2];
+            if flags != 0 {
+                return Ok(-22); // -EINVAL（不支持 AT_REMOVEDIR）
+            }
+            let mut raw = Vec::new();
+            for index in 0..4096u64 {
+                let byte = memory.read(event.args[1] + index, 1)?[0];
+                if byte == 0 {
+                    break;
+                }
+                raw.push(byte);
+            }
+            let path = Path::new(
+                std::str::from_utf8(&raw)
+                    .map_err(|_| DaotiError::Other("unlinkat 路径不是 UTF-8".into()))?,
+            );
+            let Some(candidate) = self.resolve_guest_path(path) else {
+                return Ok(-2); // -ENOENT
+            };
+            std::fs::remove_file(&candidate).map_err(DaotiError::Io)?;
+            return Ok(0);
+        }
         if matches!(event.nr, SYS_READ | SYS_PREAD64) {
             let fd = event.args[0] as i32;
             let (bytes, offset) = self
@@ -1560,6 +1652,76 @@ mod tests {
             RuntimeSyscallEvent::enter(SYS_SET_TID_ADDRESS, "set_tid_address", [0x2400; 6]);
         assert_eq!(bridge.handle(&tid_update).unwrap(), 1);
         assert_eq!(bridge.clear_child_tid, Some(0x2400));
+    }
+
+    #[test]
+    fn lseek_updates_file_offset_and_rejects_invalid_whence() {
+        let sink = BufferSink::default();
+        let mut bridge = NativeSyscallBridge::new(sink);
+        bridge.files.insert(9, (b"abcdef".to_vec(), 0));
+        let mut memory = memory();
+        let seek = RuntimeSyscallEvent::enter(SYS_LSEEK, "lseek", [9, 2, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&seek, &mut memory).unwrap(), 2);
+        let read = RuntimeSyscallEvent::enter(SYS_READ, "read", [9, 0x1100, 2, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&read, &mut memory).unwrap(), 2);
+        assert_eq!(memory.read(0x1100, 2).unwrap(), b"cd");
+
+        let invalid = RuntimeSyscallEvent::enter(SYS_LSEEK, "lseek", [9, 0, 3, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&invalid, &mut memory).unwrap(),
+            -22
+        );
+    }
+
+    #[test]
+    fn fcntl_getfl_returns_read_only_descriptor_flags() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        bridge.files.insert(9, (b"data".to_vec(), 0));
+        let mut memory = memory();
+        let event = RuntimeSyscallEvent::enter(SYS_FCNTL, "fcntl", [9, 3, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+    }
+
+    #[test]
+    fn statfs_and_fstatfs_write_linux_layout() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        bridge.files.insert(9, (b"data".to_vec(), 0));
+        let mut memory = memory();
+        for (nr, args) in [
+            (SYS_STATFS, [0x1020, 0x1200, 0, 0, 0, 0]),
+            (SYS_FSTATFS, [9, 0x1300, 0, 0, 0, 0]),
+        ] {
+            let event = RuntimeSyscallEvent::enter(nr, "statfs", args);
+            assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        }
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1200, 8).unwrap().try_into().unwrap()),
+            0x794c7630
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1300, 8).unwrap().try_into().unwrap()),
+            0x794c7630
+        );
+    }
+
+    #[test]
+    fn unlinkat_removes_only_files_under_allowed_root() {
+        let root = std::env::temp_dir().join(format!("daoti-unlink-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("victim");
+        std::fs::write(&file, b"x").unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b"victim\0").unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UNLINKAT,
+            "unlinkat",
+            [-100i64 as u64, 0x1100, 0, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        assert!(!file.exists());
+        let _ = std::fs::remove_dir(&root);
     }
 
     #[test]

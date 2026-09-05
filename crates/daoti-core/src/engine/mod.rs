@@ -204,8 +204,10 @@ mod tests {
         // 使用进程内递增序号保证每次调用得到唯一文件。
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let unique = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("daoti-engine-{}-{unique}.elf", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "daoti-engine-mod-{}-{unique}.elf",
+            std::process::id()
+        ));
         let mut data = vec![0u8; 120];
         data[0..4].copy_from_slice(b"\x7fELF");
         data[4] = 2;

@@ -478,10 +478,15 @@ impl LinuxEmulationHandler {
     fn syscall_name(nr: u64) -> &'static str {
         match nr {
             1 => "write",
+            8 => "lseek",
             21 => "access",
             63 => "uname",
             257 => "openat",
             262 => "newfstatat",
+            72 => "fcntl",
+            137 => "statfs",
+            138 => "fstatfs",
+            263 => "unlinkat",
             3 => "close",
             0 => "read",
             20 => "writev",
@@ -771,8 +776,13 @@ impl SyscallHandler for LinuxEmulationHandler {
             event.nr,
             0 | 3
                 | 5
+                | 8
                 | 9
                 | 10
+                | 72
+                | 137
+                | 138
+                | 263
                 | 12
                 | 13
                 | 14
