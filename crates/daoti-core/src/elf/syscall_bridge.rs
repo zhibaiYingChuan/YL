@@ -555,8 +555,8 @@ fn relocate_tls_image_internal_pointers(
     load_bias: u64,
     load_ranges: &[(u64, u64)],
 ) {
-    for chunk in image.chunks_exact_mut(8) {
-        let value = u64::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in image.as_chunks_mut::<8>().0 {
+        let value = u64::from_le_bytes(*chunk);
         if load_ranges
             .iter()
             .any(|(start, end)| value >= *start && value < *end)
