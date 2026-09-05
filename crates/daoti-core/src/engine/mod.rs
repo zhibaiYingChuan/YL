@@ -196,9 +196,16 @@ mod tests {
     use crate::interceptor::MockCaptureSource;
     use crate::interceptor::SyscallEvent;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_elf_path() -> PathBuf {
-        let path = std::env::temp_dir().join(format!("daoti-engine-{}.elf", std::process::id()));
+        // 并行测试共享同一 process::id() 时会竞争同一个临时文件
+        // （一个测试读到另一个测试尚未写完的内容 → "文件过短"），
+        // 使用进程内递增序号保证每次调用得到唯一文件。
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let unique = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("daoti-engine-{}-{unique}.elf", std::process::id()));
         let mut data = vec![0u8; 120];
         data[0..4].copy_from_slice(b"\x7fELF");
         data[4] = 2;
