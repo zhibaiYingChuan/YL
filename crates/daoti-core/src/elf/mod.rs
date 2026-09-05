@@ -2522,6 +2522,19 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_load_bias_underflow_rejected() {
+        // load_bias = preferred_base - lowest_vaddr：当 preferred_base 低于
+        // 最低 PT_LOAD 虚拟地址时必须显式报错，不得回绕成超大地址。
+        let d = make_dynamic_fixture(&[], 0);
+        // make_dynamic_fixture 的 PT_LOAD vaddr 起点为 0x400000。
+        let error = plan_dynamic_load(&d, 0x300000).unwrap_err();
+        assert!(
+            format!("{error}").contains("load bias 下溢"),
+            "preferred_base 低于最低段地址时必须报 load bias 下溢：{error}"
+        );
+    }
+
+    #[test]
     fn test_dynamic_truncated_rela_rejected() {
         let mut d = make_dynamic_fixture(&[], 1);
         d.truncate(0x380 + 23);

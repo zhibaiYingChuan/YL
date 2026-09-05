@@ -606,4 +606,28 @@ mod tests {
         assert_eq!(resolver.tls_owner("tls_var"), Some(2));
         assert_eq!(resolver.tls_owner("other"), None);
     }
+
+    #[test]
+    fn rejects_unsupported_relocation_type() {
+        // 未知重定位类型（如 ABI 保留值 42）必须显式报错，
+        // 不得静默跳过或错误应用，确保不支持的类型不会被假装成功。
+        let mut memory = MemoryModel::new(0x4000, 0xa000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x5000,
+                MemPerm::rw(),
+                vec![0; 0x20],
+            ))
+            .unwrap();
+        let unsupported = entry(0x1000, 7, X86_64RelocationType::Unknown(42), Some(0));
+        let error = apply_x86_64_relocations(&mut memory, &plan(0x4000), &[unsupported], &Resolver)
+            .unwrap_err();
+        let message = format!("{error}");
+        assert!(
+            message.contains("不支持的 x86_64 重定位类型"),
+            "错误必须标识不支持的类型：{message}"
+        );
+        // 报错后目标槽位不得被写入，保持原值。
+        assert_eq!(memory.read(0x5000, 8).unwrap(), [0u8; 8]);
+    }
 }
