@@ -793,6 +793,7 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 79
                 | 80
                 | 258
+                | 217
                 | 12
                 | 13
                 | 14

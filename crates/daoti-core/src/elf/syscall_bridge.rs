@@ -25,6 +25,7 @@ pub const SYS_CHDIR: u64 = 80;
 pub const SYS_FSYNC: u64 = 74;
 pub const SYS_FTRUNCATE: u64 = 77;
 pub const SYS_MKDIRAT: u64 = 258;
+pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_BRK: u64 = 12;
@@ -546,6 +547,9 @@ pub struct NativeSyscallBridge<S: OutputSink> {
     allowed_roots: Vec<PathBuf>,
     current_dir: PathBuf,
     files: HashMap<i32, (Vec<u8>, usize)>,
+    /// 目录句柄：每个条目保存宿主目录路径与下一个待返回子项序号。
+    /// Linux 的 dirfd 与文件 fd 共用编号空间，这里用单独表避免改动现有文件语义。
+    dirs: HashMap<i32, (PathBuf, usize)>,
     next_fd: i32,
     /// 主程序 PT_LOAD 已映射区间 [(start,end)…]，用于关联 mmap 返回值。
     main_ptload_ranges: Vec<(u64, u64)>,
@@ -594,6 +598,7 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             allowed_roots: Vec::new(),
             current_dir: PathBuf::new(),
             files: HashMap::new(),
+            dirs: HashMap::new(),
             next_fd: 3,
             main_ptload_ranges: Vec::new(),
             elf_tls: None,
@@ -863,9 +868,27 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 std::str::from_utf8(&raw)
                     .map_err(|_| DaotiError::Other("openat 路径不是 UTF-8".into()))?,
             );
-            let Some(candidate) = self.resolve_guest_path(path) else {
-                return Ok(-2);
+            // O_DIRECTORY=0x10000：显式目录打开；否则路径存在时按宿主类型路由。
+            let want_dir = event.args[2] & 0x10000 != 0;
+            // 优先按文件解析（含 basename 回退，支持 glibc 用绝对路径打开受控根内文件）；
+            // 文件解析不中时回落到沙盒候选（目录或尚不存在的路径按目录路由）。
+            let candidate = self.resolve_guest_path(path).or_else(|| {
+                self.resolve_sandbox_candidates(path)
+                    .into_iter()
+                    .find(|candidate| candidate.exists())
+            });
+            let Some(candidate) = candidate else {
+                return Ok(-2); // -ENOENT
             };
+            if candidate.is_dir() || want_dir {
+                if !candidate.is_dir() {
+                    return Ok(-20); // -ENOTDIR
+                }
+                let fd = self.next_fd;
+                self.next_fd += 1;
+                self.dirs.insert(fd, (candidate, 0));
+                return Ok(fd as i64);
+            }
             let bytes = std::fs::read(&candidate).map_err(DaotiError::Io)?;
             let fd = self.next_fd;
             self.next_fd += 1;
@@ -1539,6 +1562,69 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(-2); // -ENOENT：无受控根
         }
+        if event.nr == SYS_GETDENTS64 {
+            // getdents64(fd, dirp, count)：向缓冲区写 Linux x86_64
+            // struct dirent64（d_ino 8 + d_off 8 + d_reclen 2 + d_type 1 + d_name…），
+            // 缓冲区不足时保留下次续读；目录读完返回 0。
+            const DT_DIR: u8 = 4;
+            const DT_REG: u8 = 8;
+            let fd = event.args[0] as i32;
+            let buf = event.args[1];
+            let count = usize::try_from(event.args[2])
+                .map_err(|_| DaotiError::Other("getdents64 缓冲区大小超出平台范围".into()))?;
+            let (dir_path, cursor) = self
+                .dirs
+                .get_mut(&fd)
+                .ok_or_else(|| DaotiError::Other("无效目录文件描述符".into()))?;
+            let mut entries: Vec<(Vec<u8>, u8)> =
+                vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
+            let mut children: Vec<(Vec<u8>, u8)> = std::fs::read_dir(dir_path)
+                .map_err(DaotiError::Io)?
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let name = entry.file_name().to_string_lossy().as_bytes().to_vec();
+                    let is_dir = entry
+                        .file_type()
+                        .map(|file_type| file_type.is_dir())
+                        .unwrap_or(false);
+                    (name, if is_dir { DT_DIR } else { DT_REG })
+                })
+                .collect();
+            children.sort();
+            entries.append(&mut children);
+            let mut written = 0usize;
+            let mut index = *cursor;
+            while index < entries.len() {
+                let (name, file_type) = &entries[index];
+                // 头部 19 字节 + 名称（含 NUL），并按 8 字节对齐得到 d_reclen
+                let raw_len = 19 + name.len() + 1;
+                let aligned = (raw_len + 7) & !7;
+                if written + aligned > count {
+                    break;
+                }
+                let entry_start = written;
+                // d_ino：稳定模拟号；d_off：下一项相对起点偏移
+                memory.write(
+                    buf + entry_start as u64,
+                    &(1000u64 + index as u64).to_le_bytes(),
+                )?;
+                memory.write(
+                    buf + entry_start as u64 + 8,
+                    &((entry_start + aligned) as u64).to_le_bytes(),
+                )?;
+                memory.write(
+                    buf + entry_start as u64 + 16,
+                    &(aligned as u16).to_le_bytes(),
+                )?;
+                memory.write(buf + entry_start as u64 + 18, &[*file_type])?;
+                memory.write(buf + entry_start as u64 + 19, name)?;
+                memory.write(buf + entry_start as u64 + 19 + name.len() as u64, &[0])?;
+                written += aligned;
+                index += 1;
+            }
+            *cursor = index;
+            return Ok(written as i64);
+        }
         if event.nr == SYS_BRK {
             let raw = self.current_brk;
             let new_brk = event.args[0];
@@ -1937,6 +2023,70 @@ mod tests {
         let grow = RuntimeSyscallEvent::enter(SYS_FTRUNCATE, "ftruncate", [9, 8, 0, 0, 0, 0]);
         assert_eq!(bridge.handle_with_memory(&grow, &mut memory).unwrap(), 0);
         assert_eq!(bridge.files.get(&9).unwrap().0, b"abc\0\0\0\0\0");
+    }
+
+    #[test]
+    fn getdents64_enumerates_directory_entries_with_linux_layout() {
+        let root = std::env::temp_dir().join(format!("daoti-dents-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        std::fs::write(root.join("b"), b"y").unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        // 打开目录句柄（"." 解析到受控根）
+        memory.write(0x1100, b".\0").unwrap();
+        let open = RuntimeSyscallEvent::enter(
+            SYS_OPENAT,
+            "openat",
+            [-100i64 as u64, 0x1100, 0x10000, 0, 0, 0],
+        );
+        let fd = bridge.handle_with_memory(&open, &mut memory).unwrap() as i32;
+        assert!(fd >= 3);
+        let mut names: Vec<(String, u8)> = Vec::new();
+        loop {
+            let event = RuntimeSyscallEvent::enter(
+                SYS_GETDENTS64,
+                "getdents64",
+                [fd as u64, 0x1300, 4096, 0, 0, 0],
+            );
+            let n = bridge.handle_with_memory(&event, &mut memory).unwrap();
+            assert!(n >= 0);
+            if n == 0 {
+                break;
+            }
+            let mut offset = 0usize;
+            while (offset as u64) < (n as u64) {
+                let reclen = u16::from_le_bytes(
+                    memory
+                        .read(0x1300 + offset as u64 + 16, 2)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let file_type = memory.read(0x1300 + offset as u64 + 18, 1).unwrap()[0];
+                let name_len = reclen.saturating_sub(19);
+                let raw = memory
+                    .read(0x1300 + offset as u64 + 19, name_len as u64)
+                    .unwrap();
+                let name = String::from_utf8(raw.to_vec())
+                    .unwrap()
+                    .trim_end_matches('\0')
+                    .to_string();
+                names.push((name, file_type));
+                offset += reclen;
+            }
+        }
+        let type_of: std::collections::HashMap<&str, u8> = names
+            .iter()
+            .map(|(name, ty)| (name.as_str(), *ty))
+            .collect();
+        assert_eq!(type_of.get("."), Some(&4)); // DT_DIR
+        assert_eq!(type_of.get(".."), Some(&4));
+        assert_eq!(type_of.get("a.txt"), Some(&8)); // DT_REG
+        assert_eq!(type_of.get("b"), Some(&8));
+        assert_eq!(type_of.get("sub"), Some(&4)); // DT_DIR
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
