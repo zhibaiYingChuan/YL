@@ -36,6 +36,19 @@ pub const SYS_MUNLOCKALL: u64 = 152;
 pub const SYS_MREMAP: u64 = 25;
 pub const MREMAP_MAYMOVE: u64 = 1;
 pub const MREMAP_FIXED: u64 = 2;
+pub const SYS_GETPPID: u64 = 110;
+pub const SYS_GETUID: u64 = 102;
+pub const SYS_GETEUID: u64 = 107;
+pub const SYS_GETGID: u64 = 104;
+pub const SYS_GETEGID: u64 = 108;
+pub const SYS_GETRESUID: u64 = 118;
+pub const SYS_GETRESGID: u64 = 119;
+pub const SYS_SYSINFO: u64 = 99;
+pub const SYS_UMASK: u64 = 95;
+pub const SYS_GETPGID: u64 = 121;
+pub const SYS_GETPGRP: u64 = 111;
+pub const SYS_SETSID: u64 = 112;
+pub const SYS_WAIT4: u64 = 61;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_BRK: u64 = 12;
@@ -556,6 +569,8 @@ pub struct NativeSyscallBridge<S: OutputSink> {
     stack_guard: u64,
     allowed_roots: Vec<PathBuf>,
     current_dir: PathBuf,
+    /// 进程 umask（SYS_UMASK 维护），初始 022，符合 Unix 常规默认。
+    umask: u32,
     files: HashMap<i32, (Vec<u8>, usize)>,
     /// 目录句柄：每个条目保存宿主目录路径与下一个待返回子项序号。
     /// Linux 的 dirfd 与文件 fd 共用编号空间，这里用单独表避免改动现有文件语义。
@@ -607,6 +622,7 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             stack_guard: 0,
             allowed_roots: Vec::new(),
             current_dir: PathBuf::new(),
+            umask: 0o22,
             files: HashMap::new(),
             dirs: HashMap::new(),
             next_fd: 3,
@@ -1516,6 +1532,55 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 return Ok(0);
             }
             return Ok(0);
+        }
+        if event.nr == SYS_GETPPID
+            || event.nr == SYS_GETUID
+            || event.nr == SYS_GETEUID
+            || event.nr == SYS_GETGID
+            || event.nr == SYS_GETEGID
+            || event.nr == SYS_GETPGID
+            || event.nr == SYS_GETPGRP
+            || event.nr == SYS_SETSID
+        {
+            // 单进程仿真：pid/tid/ppid/pgid/sid 稳定为 1，uid/gid 稳定为 1000。
+            return match event.nr {
+                SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => Ok(1000),
+                _ => Ok(1),
+            };
+        }
+        if event.nr == SYS_GETRESUID || event.nr == SYS_GETRESGID {
+            // getresuid/getresgid 各写 3 个 u32（real/effective/saved）。
+            for address in event.args[0..3].iter().take(3) {
+                memory.write(*address, &1000u32.to_le_bytes())?;
+            }
+            return Ok(0);
+        }
+        if event.nr == SYS_SYSINFO {
+            // struct sysinfo x86_64：uptime(0)/loads[3](8)/totalram(32)/freeram(40)/
+            // sharedram(48)/bufferram(56)/totalswap(64)/freeswap(72)/procs(80 u16)/
+            // mem_unit(104 u32)。
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| DaotiError::Other(format!("系统时间不可用：{e}")))?
+                .as_secs();
+            let mut info = [0u8; 112];
+            info[0..8].copy_from_slice(&now.to_le_bytes());
+            info[32..40].copy_from_slice(&(8u64 << 30).to_le_bytes()); // totalram=8GB
+            info[40..48].copy_from_slice(&(4u64 << 30).to_le_bytes()); // freeram=4GB
+            info[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs=1
+            info[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit=1
+            memory.write(event.args[0], &info)?;
+            return Ok(0);
+        }
+        if event.nr == SYS_UMASK {
+            // umask(mask)：返回旧值并设置新值。
+            let previous = self.umask;
+            self.umask = (event.args[0] & 0o777) as u32;
+            return Ok(previous as i64);
+        }
+        if event.nr == SYS_WAIT4 {
+            // 单进程仿真无子进程：wait4 恒返回 -ECHILD。
+            return Ok(-10);
         }
         if event.nr == SYS_GETCWD {
             // getcwd(buf, bufsiz)：返回 guest 视角当前目录（受控根内相对绝对路径）。
@@ -2610,6 +2675,104 @@ mod tests {
             bridge.handle_with_memory(&unmapped, &mut memory).unwrap(),
             -14
         );
+    }
+
+    #[test]
+    fn process_identity_queries_return_stable_values() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x5000);
+        for (nr, expected) in [
+            (SYS_GETPPID, 1),
+            (SYS_GETUID, 1000),
+            (SYS_GETEUID, 1000),
+            (SYS_GETGID, 1000),
+            (SYS_GETEGID, 1000),
+            (SYS_GETPGID, 1),
+            (SYS_GETPGRP, 1),
+            (SYS_SETSID, 1),
+        ] {
+            let event = RuntimeSyscallEvent::enter(nr, "process-query", [0; 6]);
+            assert_eq!(
+                bridge.handle_with_memory(&event, &mut memory).unwrap(),
+                expected,
+                "syscall nr={nr}"
+            );
+        }
+    }
+
+    #[test]
+    fn getresuid_and_getresgid_write_three_ids() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // getresuid(ruid, euid, suid)
+        let event = RuntimeSyscallEvent::enter(
+            SYS_GETRESUID,
+            "getresuid",
+            [0x1100, 0x1110, 0x1120, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        for addr in [0x1100u64, 0x1110, 0x1120] {
+            assert_eq!(
+                u32::from_le_bytes(memory.read(addr, 4).unwrap().try_into().unwrap()),
+                1000
+            );
+        }
+        // getresgid(rgid, egid, sgid)
+        let event = RuntimeSyscallEvent::enter(
+            SYS_GETRESGID,
+            "getresgid",
+            [0x1130, 0x1140, 0x1150, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        for addr in [0x1130u64, 0x1140, 0x1150] {
+            assert_eq!(
+                u32::from_le_bytes(memory.read(addr, 4).unwrap().try_into().unwrap()),
+                1000
+            );
+        }
+    }
+
+    #[test]
+    fn sysinfo_writes_linux_layout() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let event = RuntimeSyscallEvent::enter(SYS_SYSINFO, "sysinfo", [0x1200, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        // struct sysinfo x86_64：uptime(0)/loads[3](8)/totalram(32)/freeram(40)/procs(80 u16)/mem_unit(104 u32)
+        let uptime = u64::from_le_bytes(memory.read(0x1200, 8).unwrap().try_into().unwrap());
+        let totalram = u64::from_le_bytes(memory.read(0x1220, 8).unwrap().try_into().unwrap());
+        let procs = u16::from_le_bytes(memory.read(0x1250, 2).unwrap().try_into().unwrap());
+        let mem_unit = u32::from_le_bytes(memory.read(0x1268, 4).unwrap().try_into().unwrap());
+        assert!(uptime > 0);
+        assert!(totalram > 0);
+        assert!(procs >= 1);
+        assert!(mem_unit >= 1);
+    }
+
+    #[test]
+    fn umask_sets_and_returns_previous() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // 初始 022
+        let query = RuntimeSyscallEvent::enter(SYS_UMASK, "umask", [0o077, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&query, &mut memory).unwrap(),
+            0o22
+        );
+        // 再次设置 0 → 返回上次值 077
+        let query = RuntimeSyscallEvent::enter(SYS_UMASK, "umask", [0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&query, &mut memory).unwrap(),
+            0o77
+        );
+    }
+
+    #[test]
+    fn wait4_without_children_returns_echild() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let event = RuntimeSyscallEvent::enter(SYS_WAIT4, "wait4", [0, 0x1100, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -10);
     }
 
     #[test]

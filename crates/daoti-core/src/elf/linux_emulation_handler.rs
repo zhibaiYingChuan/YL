@@ -520,6 +520,19 @@ impl LinuxEmulationHandler {
             14 => "rt_sigprocmask",
             16 => "ioctl",
             39 => "getpid",
+            110 => "getppid",
+            102 => "getuid",
+            107 => "geteuid",
+            104 => "getgid",
+            108 => "getegid",
+            118 => "getresuid",
+            119 => "getresgid",
+            99 => "sysinfo",
+            95 => "umask",
+            121 => "getpgid",
+            111 => "getpgrp",
+            112 => "setsid",
+            61 => "wait4",
             89 => "readlink",
             117 => "raise",
             267 => "readlinkat",
@@ -817,6 +830,19 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 21
                 | 28
                 | 39
+                | 110
+                | 102
+                | 107
+                | 104
+                | 108
+                | 118
+                | 119
+                | 99
+                | 95
+                | 121
+                | 111
+                | 112
+                | 61
                 | 89
                 | 117
                 | 158
