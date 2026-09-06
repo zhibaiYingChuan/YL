@@ -478,6 +478,12 @@ impl LinuxEmulationHandler {
     fn syscall_name(nr: u64) -> &'static str {
         match nr {
             1 => "write",
+            293 => "pipe2",
+            290 => "eventfd2",
+            283 => "timerfd_create",
+            286 => "timerfd_settime",
+            287 => "timerfd_gettime",
+            7 => "poll",
             8 => "lseek",
             21 => "access",
             63 => "uname",
@@ -823,6 +829,12 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 80
                 | 258
                 | 217
+                | 293
+                | 290
+                | 283
+                | 286
+                | 287
+                | 7
                 | 13
                 | 14
                 | 16

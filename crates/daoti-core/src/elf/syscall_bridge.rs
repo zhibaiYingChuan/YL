@@ -51,6 +51,12 @@ pub const SYS_SETSID: u64 = 112;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
+pub const SYS_PIPE2: u64 = 293;
+pub const SYS_EVENTFD2: u64 = 290;
+pub const SYS_TIMERFD_CREATE: u64 = 283;
+pub const SYS_TIMERFD_SETTIME: u64 = 286;
+pub const SYS_TIMERFD_GETTIME: u64 = 287;
+pub const SYS_POLL: u64 = 7;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MADVISE: u64 = 28;
@@ -555,6 +561,9 @@ pub fn shadow_inference_observer(
     })
 }
 
+type PipeBuffer = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>;
+type PipeHandle = (PipeBuffer, bool);
+
 pub struct NativeSyscallBridge<S: OutputSink> {
     sink: S,
     observer: Option<RuntimeSyscallObserver>,
@@ -572,6 +581,13 @@ pub struct NativeSyscallBridge<S: OutputSink> {
     /// 进程 umask（SYS_UMASK 维护），初始 022，符合 Unix 常规默认。
     umask: u32,
     files: HashMap<i32, (Vec<u8>, usize)>,
+    /// 管道缓冲：pipe2 分配两个 fd 指向同一共享缓冲（读端消费、写端追加）。
+    /// Linux dirfd 与文件 fd 共用编号空间，这里用单独表避免改动现有文件语义。
+    pipes: HashMap<i32, PipeHandle>,
+    /// eventfd2 计数器：读返回计数并清零，写累加。
+    eventfds: HashMap<i32, u64>,
+    /// timerfd：CLOCK_MONOTONIC 下记录本次到期时刻（纳秒单调时钟）；None 表示未 arm。
+    timerfds: HashMap<i32, Option<u64>>,
     /// 目录句柄：每个条目保存宿主目录路径与下一个待返回子项序号。
     /// Linux 的 dirfd 与文件 fd 共用编号空间，这里用单独表避免改动现有文件语义。
     dirs: HashMap<i32, (PathBuf, usize)>,
@@ -624,6 +640,9 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             current_dir: PathBuf::new(),
             umask: 0o22,
             files: HashMap::new(),
+            pipes: HashMap::new(),
+            eventfds: HashMap::new(),
+            timerfds: HashMap::new(),
             dirs: HashMap::new(),
             next_fd: 3,
             main_ptload_ranges: Vec::new(),
@@ -964,7 +983,13 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             // 但仍需校验 fd 真实存在（stdin/stdout/stderr 0..2 恒有效），
             // 未知 fd 返回 -EBADF，与 Linux 语义一致。
             let fd = event.args[0] as i32;
-            if self.files.contains_key(&fd) || self.dirs.contains_key(&fd) || fd < 3 {
+            if self.files.contains_key(&fd)
+                || self.dirs.contains_key(&fd)
+                || self.pipes.contains_key(&fd)
+                || self.eventfds.contains_key(&fd)
+                || self.timerfds.contains_key(&fd)
+                || fd < 3
+            {
                 return Ok(0);
             }
             return Ok(-9); // -EBADF
@@ -1058,6 +1083,49 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
         }
         if matches!(event.nr, SYS_READ | SYS_PREAD64) {
             let fd = event.args[0] as i32;
+            if let Some((shared, is_write_end)) = self.pipes.get(&fd) {
+                if *is_write_end {
+                    return Ok(-9);
+                }
+                let count = usize::try_from(event.args[2])
+                    .map_err(|_| DaotiError::Other("pipe read 长度溢出".into()))?;
+                let mut buffer = shared
+                    .lock()
+                    .map_err(|_| DaotiError::Other("管道锁中毒".into()))?;
+                let take = count.min(buffer.len());
+                if take == 0 {
+                    return Ok(-11); // -EAGAIN：无数据且写端仍存在
+                }
+                let data: Vec<u8> = buffer.drain(..take).collect();
+                memory.write(event.args[1], &data)?;
+                return Ok(take as i64);
+            }
+            if let Some(counter) = self.eventfds.get_mut(&fd) {
+                if event.args[2] < 8 {
+                    return Ok(-22);
+                }
+                if *counter == 0 {
+                    return Ok(-11);
+                }
+                memory.write(event.args[1], &counter.to_le_bytes())?;
+                *counter = 0;
+                return Ok(8);
+            }
+            if let Some(deadline) = self.timerfds.get_mut(&fd) {
+                if event.args[2] < 8 {
+                    return Ok(-22);
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| DaotiError::Other(format!("系统时间不可用：{e}")))?
+                    .as_nanos() as u64;
+                if deadline.is_none_or(|value| now < value) {
+                    return Ok(-11);
+                }
+                memory.write(event.args[1], &1u64.to_le_bytes())?;
+                *deadline = None;
+                return Ok(8);
+            }
             let (bytes, offset) = self
                 .files
                 .get_mut(&fd)
@@ -1533,6 +1601,80 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(0);
         }
+        if event.nr == SYS_PIPE2 {
+            if event.args[1] & !0x80000 != 0 {
+                return Ok(-22); // -EINVAL，除 O_CLOEXEC 外不接受标志
+            }
+            let shared =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let read_fd = self.next_fd;
+            let write_fd = self.next_fd + 1;
+            self.next_fd += 2;
+            self.pipes.insert(read_fd, (shared.clone(), false));
+            self.pipes.insert(write_fd, (shared, true));
+            let mut fds = [0u8; 8];
+            fds[..4].copy_from_slice(&(read_fd as u32).to_le_bytes());
+            fds[4..].copy_from_slice(&(write_fd as u32).to_le_bytes());
+            memory.write(event.args[0], &fds)?;
+            return Ok(0);
+        }
+        if event.nr == SYS_EVENTFD2 {
+            if event.args[1] & !0x80000 != 0 {
+                return Ok(-22); // -EINVAL
+            }
+            let fd = self.next_fd;
+            self.next_fd += 1;
+            self.eventfds.insert(fd, event.args[0]);
+            return Ok(fd as i64);
+        }
+        if event.nr == SYS_TIMERFD_CREATE {
+            // 仅支持 CLOCK_MONOTONIC=1；timerfd flags 只接受 O_CLOEXEC。
+            if event.args[0] != 1 || event.args[1] & !0x80000 != 0 {
+                return Ok(-22); // -EINVAL
+            }
+            let fd = self.next_fd;
+            self.next_fd += 1;
+            self.timerfds.insert(fd, None);
+            return Ok(fd as i64);
+        }
+        if event.nr == SYS_TIMERFD_SETTIME {
+            let fd = event.args[0] as i32;
+            if !self.timerfds.contains_key(&fd) {
+                return Ok(-9); // -EBADF
+            }
+            let spec = memory.read(event.args[2], 32)?;
+            let sec = u64::from_le_bytes(spec[16..24].try_into().unwrap());
+            let nsec = u64::from_le_bytes(spec[24..32].try_into().unwrap());
+            if nsec >= 1_000_000_000 {
+                return Ok(-22);
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| DaotiError::Other(format!("系统时间不可用：{e}")))?
+                .as_nanos() as u64;
+            self.timerfds.insert(
+                fd,
+                Some(now.saturating_add(sec.saturating_mul(1_000_000_000) + nsec)),
+            );
+            return Ok(0);
+        }
+        if event.nr == SYS_TIMERFD_GETTIME {
+            let fd = event.args[0] as i32;
+            let deadline = match self.timerfds.get(&fd) {
+                Some(value) => *value,
+                None => return Ok(-9),
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| DaotiError::Other(format!("系统时间不可用：{e}")))?
+                .as_nanos() as u64;
+            let remaining = deadline.map(|value| value.saturating_sub(now)).unwrap_or(0);
+            let mut spec = [0u8; 32];
+            spec[16..24].copy_from_slice(&(remaining / 1_000_000_000).to_le_bytes());
+            spec[24..32].copy_from_slice(&(remaining % 1_000_000_000).to_le_bytes());
+            memory.write(event.args[1], &spec)?;
+            return Ok(0);
+        }
         if event.nr == SYS_GETPPID
             || event.nr == SYS_GETUID
             || event.nr == SYS_GETEUID
@@ -1946,6 +2088,29 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             return self.handle(event);
         }
         let fd = event.args[0];
+        let fd_i32 = fd as i32;
+        if let Some((shared, is_write_end)) = self.pipes.get(&fd_i32) {
+            if !*is_write_end {
+                return Ok(-9);
+            }
+            let length = usize::try_from(event.args[2])
+                .map_err(|_| DaotiError::Other("pipe write 长度溢出".into()))?;
+            let data = memory.read(event.args[1], length as u64)?;
+            let mut buffer = shared
+                .lock()
+                .map_err(|_| DaotiError::Other("管道锁中毒".into()))?;
+            buffer.extend(data.iter().copied());
+            return Ok(length as i64);
+        }
+        if let Some(counter) = self.eventfds.get_mut(&fd_i32) {
+            if event.args[2] < 8 {
+                return Ok(-22);
+            }
+            let data = memory.read(event.args[1], 8)?;
+            let value = u64::from_le_bytes(data.try_into().unwrap());
+            *counter = counter.saturating_add(value);
+            return Ok(8);
+        }
         if fd != 1 && fd != 2 {
             return Err(DaotiError::Unavailable(format!(
                 "write 仅支持 stdout/stderr，fd={fd}"
@@ -2773,6 +2938,111 @@ mod tests {
         let mut memory = memory();
         let event = RuntimeSyscallEvent::enter(SYS_WAIT4, "wait4", [0, 0x1100, 0, 0, 0, 0]);
         assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -10);
+    }
+
+    #[test]
+    fn pipe2_flows_bytes_and_blocks_empty_read() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        let create = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&create, &mut memory).unwrap(), 0);
+        let fds: [u32; 2] = [
+            u32::from_le_bytes(memory.read(0x1200, 4).unwrap().try_into().unwrap()),
+            u32::from_le_bytes(memory.read(0x1204, 4).unwrap().try_into().unwrap()),
+        ];
+        assert_ne!(fds[0], fds[1]);
+        // 写端写入
+        memory.write(0x1100, b"hello").unwrap();
+        let write =
+            RuntimeSyscallEvent::enter(SYS_WRITE, "write", [fds[1] as u64, 0x1100, 5, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&write, &mut memory).unwrap(), 5);
+        // 读端读出
+        let read =
+            RuntimeSyscallEvent::enter(SYS_READ, "read", [fds[0] as u64, 0x1120, 16, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&read, &mut memory).unwrap(), 5);
+        assert_eq!(&memory.read(0x1120, 5).unwrap(), b"hello");
+        // 空管道读 → EAGAIN
+        let empty =
+            RuntimeSyscallEvent::enter(SYS_READ, "read", [fds[0] as u64, 0x1120, 16, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&empty, &mut memory).unwrap(), -11);
+    }
+
+    #[test]
+    fn eventfd2_counter_accumulates_and_clears_on_read() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        let create = RuntimeSyscallEvent::enter(SYS_EVENTFD2, "eventfd2", [0, 0, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&create, &mut memory).unwrap() as i32;
+        assert!(fd >= 3);
+        // 写 3 再写 2 → 计数 5
+        memory.write(0x1100, &3u64.to_le_bytes()).unwrap();
+        let w1 = RuntimeSyscallEvent::enter(SYS_WRITE, "write", [fd as u64, 0x1100, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&w1, &mut memory).unwrap(), 8);
+        memory.write(0x1100, &2u64.to_le_bytes()).unwrap();
+        let w3 = RuntimeSyscallEvent::enter(SYS_WRITE, "write", [fd as u64, 0x1100, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&w3, &mut memory).unwrap(), 8);
+        // 读 → 5 并清零
+        let read = RuntimeSyscallEvent::enter(SYS_READ, "read", [fd as u64, 0x1120, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&read, &mut memory).unwrap(), 8);
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1120, 8).unwrap().try_into().unwrap()),
+            5
+        );
+        // 清零后再读 → EAGAIN
+        let again = RuntimeSyscallEvent::enter(SYS_READ, "read", [fd as u64, 0x1120, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&again, &mut memory).unwrap(), -11);
+    }
+
+    #[test]
+    fn timerfd_settime_and_gettime_roundtrip() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        let create =
+            RuntimeSyscallEvent::enter(SYS_TIMERFD_CREATE, "timerfd_create", [1, 0, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&create, &mut memory).unwrap() as i32;
+        assert!(fd >= 3);
+        // 设置 10ms 定时（itimerspec：it_interval[0..16] + it_value[16..32]，
+        // it_value.tv_sec=[16..24], tv_nsec=[24..32]）
+        let mut spec = [0u8; 32];
+        spec[24..28].copy_from_slice(&10_000_000u32.to_le_bytes());
+        memory.write(0x1300, &spec).unwrap();
+        let settime = RuntimeSyscallEvent::enter(
+            SYS_TIMERFD_SETTIME,
+            "timerfd_settime",
+            [fd as u64, 0, 0x1300, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&settime, &mut memory).unwrap(), 0);
+        // gettime 查询剩余时间（>=1ns）
+        let gettime = RuntimeSyscallEvent::enter(
+            SYS_TIMERFD_GETTIME,
+            "timerfd_gettime",
+            [fd as u64, 0x1400, 0, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&gettime, &mut memory).unwrap(), 0);
+        let remaining_ns = u64::from_le_bytes(memory.read(0x1410, 8).unwrap().try_into().unwrap())
+            + u64::from_le_bytes(memory.read(0x1418, 8).unwrap().try_into().unwrap());
+        assert!(remaining_ns > 0);
     }
 
     #[test]
