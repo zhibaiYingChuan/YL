@@ -1601,6 +1601,54 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(0);
         }
+        if event.nr == SYS_POLL {
+            // poll(struct pollfd *fds, nfds, timeout)：pollfd 为 fd(i32)+events(i16)+revents(i16)，共 8 字节。
+            // 当前仿真不阻塞：立即根据设备状态计算就绪事件。
+            let count = usize::try_from(event.args[1])
+                .map_err(|_| DaotiError::Other("poll 数量超出平台范围".into()))?;
+            let mut ready = 0i64;
+            for index in 0..count {
+                let address = event.args[0]
+                    .checked_add((index as u64) * 8)
+                    .ok_or_else(|| DaotiError::Other("poll 数组地址溢出".into()))?;
+                let raw = memory.read(address, 8)?;
+                let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+                let events = i16::from_le_bytes(raw[4..6].try_into().unwrap()) as u16;
+                let mut revents = 0u16;
+                if fd == 1 || fd == 2 {
+                    revents |= events & 0x0004; // POLLOUT
+                } else if let Some((shared, is_write_end)) = self.pipes.get(&fd) {
+                    if *is_write_end {
+                        revents |= events & 0x0004;
+                    } else if !shared
+                        .lock()
+                        .map_err(|_| DaotiError::Other("管道锁中毒".into()))?
+                        .is_empty()
+                    {
+                        revents |= events & 0x0001; // POLLIN
+                    }
+                } else if let Some(counter) = self.eventfds.get(&fd) {
+                    if *counter > 0 {
+                        revents |= events & 0x0001;
+                    }
+                } else if let Some(deadline) = self.timerfds.get(&fd) {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|e| DaotiError::Other(format!("系统时间不可用：{e}")))?
+                        .as_nanos() as u64;
+                    if deadline.is_some_and(|value| now >= value) {
+                        revents |= events & 0x0001;
+                    }
+                } else {
+                    revents |= events & 0x0001;
+                }
+                memory.write(address + 6, &revents.to_le_bytes())?;
+                if revents != 0 {
+                    ready += 1;
+                }
+            }
+            return Ok(ready);
+        }
         if event.nr == SYS_PIPE2 {
             if event.args[1] & !0x80000 != 0 {
                 return Ok(-22); // -EINVAL，除 O_CLOEXEC 外不接受标志
@@ -3043,6 +3091,54 @@ mod tests {
         let remaining_ns = u64::from_le_bytes(memory.read(0x1410, 8).unwrap().try_into().unwrap())
             + u64::from_le_bytes(memory.read(0x1418, 8).unwrap().try_into().unwrap());
         assert!(remaining_ns > 0);
+    }
+
+    #[test]
+    fn poll_reports_pipe_and_stdout_readiness() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        let create = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&create, &mut memory).unwrap();
+        let read_fd = u32::from_le_bytes(memory.read(0x1200, 4).unwrap().try_into().unwrap());
+        let write_fd = u32::from_le_bytes(memory.read(0x1204, 4).unwrap().try_into().unwrap());
+        memory.write(0x1100, b"x").unwrap();
+        let write =
+            RuntimeSyscallEvent::enter(SYS_WRITE, "write", [write_fd as u64, 0x1100, 1, 0, 0, 0]);
+        bridge.handle_with_memory(&write, &mut memory).unwrap();
+        // pollfd：pipe 读端监听 POLLIN，stdout 监听 POLLOUT
+        memory
+            .write(0x1300, &(read_fd as i32).to_le_bytes())
+            .unwrap();
+        memory.write(0x1304, &1u16.to_le_bytes()).unwrap();
+        memory.write(0x1306, &[0, 0]).unwrap();
+        memory.write(0x1308, &1i32.to_le_bytes()).unwrap();
+        memory.write(0x130c, &4u16.to_le_bytes()).unwrap();
+        memory.write(0x130e, &[0, 0]).unwrap();
+        let poll = RuntimeSyscallEvent::enter(SYS_POLL, "poll", [0x1300, 2, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&poll, &mut memory).unwrap(), 2);
+        assert_eq!(
+            u16::from_le_bytes(memory.read(0x1306, 2).unwrap().try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u16::from_le_bytes(memory.read(0x130e, 2).unwrap().try_into().unwrap()),
+            4
+        );
+    }
+
+    #[test]
+    fn poll_rejects_unreadable_pollfd_array() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x2000);
+        let poll = RuntimeSyscallEvent::enter(SYS_POLL, "poll", [0x1800, 1, 0, 0, 0, 0]);
+        assert!(bridge.handle_with_memory(&poll, &mut memory).is_err());
     }
 
     #[test]
