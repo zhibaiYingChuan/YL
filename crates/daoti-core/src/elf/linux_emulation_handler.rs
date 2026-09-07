@@ -490,6 +490,8 @@ impl LinuxEmulationHandler {
             232 => "epoll_wait",
             41 => "socket",
             44 => "sendto",
+            46 => "sendmsg",
+            47 => "recvmsg",
             45 => "recvfrom",
             48 => "shutdown",
             51 => "getsockname",
@@ -831,6 +833,8 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 41
                 | 42
                 | 44
+                | 46
+                | 47
                 | 45
                 | 48
                 | 49

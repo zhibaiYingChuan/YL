@@ -66,6 +66,8 @@ pub const SYS_EPOLL_CREATE1: u64 = 291;
 pub const SYS_SOCKET: u64 = 41;
 pub const SYS_CONNECT: u64 = 42;
 pub const SYS_SENDTO: u64 = 44;
+pub const SYS_SENDMSG: u64 = 46;
+pub const SYS_RECVMSG: u64 = 47;
 pub const SYS_RECVFROM: u64 = 45;
 pub const SYS_SHUTDOWN: u64 = 48;
 pub const SYS_BIND: u64 = 49;
@@ -2122,6 +2124,91 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 return Ok(accepted as i64);
             }
             _ => {}
+        }
+        if event.nr == SYS_SENDMSG || event.nr == SYS_RECVMSG {
+            // sendmsg/recvmsg(fd, msghdr*, flags)：x86_64 msghdr 布局 56 字节：
+            //   msg_name(8)+msg_namelen(8)+msg_iov(8)+msg_iovlen(8)+msg_control(8)+msg_controllen(8)+msg_flags(4)
+            // sendmsg 将 iov 段聚合后写入发送缓冲；recvmsg 从接收缓冲分散读出并回填长度。
+            let fd = event.args[0] as i32;
+            let header = event.args[1];
+            if !self.sockets.contains_key(&fd) {
+                return Ok(-9); // -EBADF
+            }
+            let raw = memory.read(header, 56)?;
+            let iov_base = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+            let iov_count = usize::try_from(u64::from_le_bytes(raw[24..32].try_into().unwrap()))
+                .map_err(|_| DaotiError::Other("msghdr iovlen 超出平台范围".into()))?;
+            if event.nr == SYS_SENDMSG {
+                let Some(state) = self.sockets.get_mut(&fd) else {
+                    unreachable!("已校验 sockets.contains_key");
+                };
+                if state.shutdown & 0b10 != 0 {
+                    return Ok(-32); // -EPIPE：写方向已关闭
+                }
+                let Some(tx) = state.tx.clone() else {
+                    return Ok(-107); // -ENOTCONN：未连接 socket 无法发送
+                };
+                let mut total = 0usize;
+                for index in 0..iov_count {
+                    let entry = iov_base
+                        .checked_add((index as u64).saturating_mul(16))
+                        .ok_or_else(|| DaotiError::Other("sendmsg iovec 地址溢出".into()))?;
+                    let address = u64::from_le_bytes(memory.read(entry, 8)?.try_into().unwrap());
+                    let length = usize::try_from(u64::from_le_bytes(
+                        memory.read(entry + 8, 8)?.try_into().unwrap(),
+                    ))
+                    .map_err(|_| DaotiError::Other("sendmsg iov_len 溢出".into()))?;
+                    let payload = memory.read(address, length as u64)?;
+                    tx.lock()
+                        .map_err(|_| DaotiError::Other("socket 发送缓冲锁中毒".into()))?
+                        .extend(payload.iter().copied());
+                    total += length;
+                }
+                return Ok(total as i64);
+            }
+            let Some(state) = self.sockets.get(&fd) else {
+                unreachable!("已校验 sockets.contains_key");
+            };
+            let Some(rx) = state.rx.clone() else {
+                return Ok(-11); // -EAGAIN：未连接 socket 无可读数据
+            };
+            // 先读取 iov 目标地址与容量（锁内不能持有 memory 的可变借用，先收集）。
+            let mut targets = Vec::with_capacity(iov_count);
+            let mut capacity_total = 0usize;
+            for index in 0..iov_count {
+                let entry = iov_base
+                    .checked_add((index as u64).saturating_mul(16))
+                    .ok_or_else(|| DaotiError::Other("recvmsg iovec 地址溢出".into()))?;
+                let address = u64::from_le_bytes(memory.read(entry, 8)?.try_into().unwrap());
+                let capacity = u64::from_le_bytes(memory.read(entry + 8, 8)?.try_into().unwrap());
+                let capacity = usize::try_from(capacity)
+                    .map_err(|_| DaotiError::Other("recvmsg iov_len 溢出".into()))?;
+                capacity_total = capacity_total.saturating_add(capacity);
+                targets.push((address, capacity));
+            }
+            // 一次性取出最多总容量的数据（超过部分丢弃，符合流语义）。
+            let mut rx = rx
+                .lock()
+                .map_err(|_| DaotiError::Other("socket 接收缓冲锁中毒".into()))?;
+            if rx.is_empty() {
+                return Ok(-11); // -EAGAIN：空读缓冲
+            }
+            let take_total = capacity_total.min(rx.len());
+            let data: Vec<u8> = rx.drain(..take_total).collect();
+            drop(rx);
+            let mut offset = 0usize;
+            for (address, capacity) in targets {
+                if offset >= data.len() {
+                    break;
+                }
+                let take = capacity.min(data.len() - offset);
+                memory.write(address, &data[offset..offset + take])?;
+                offset += take;
+            }
+            // 回填 msg_namelen 与 msg_flags 为 0（无对端地址/无标志语义）。
+            memory.write(header + 8, &0u64.to_le_bytes())?;
+            memory.write(header + 48, &0u32.to_le_bytes())?;
+            return Ok(offset as i64);
         }
         if event.nr == SYS_SENDTO || event.nr == SYS_RECVFROM {
             let fd = event.args[0] as i32;
@@ -4291,6 +4378,73 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(memory.read(0x1408, 8).unwrap().try_into().unwrap()),
             0x42
+        );
+    }
+
+    #[test]
+    fn sendmsg_recvmsg_transfers_iovec_payload_over_socketpair() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, fds@0x1100)
+        let create =
+            RuntimeSyscallEvent::enter(SYS_SOCKETPAIR, "socketpair", [1, 1, 0, 0x1100, 0, 0]);
+        bridge.handle_with_memory(&create, &mut memory).unwrap();
+        let fd_a = i64::from(u32::from_le_bytes(
+            memory.read(0x1100, 4).unwrap().try_into().unwrap(),
+        ));
+        let fd_b = i64::from(u32::from_le_bytes(
+            memory.read(0x1104, 4).unwrap().try_into().unwrap(),
+        ));
+        // 载荷分散在两段 iov：0x1200="he"，0x1210="llo"
+        memory.write(0x1200, b"he").unwrap();
+        memory.write(0x1210, b"llo").unwrap();
+        // iovec 数组（16 字节/项）@0x1300：base(8) + len(8)
+        memory.write(0x1300, &0x1200u64.to_le_bytes()).unwrap();
+        memory.write(0x1308, &2u64.to_le_bytes()).unwrap();
+        memory.write(0x1310, &0x1210u64.to_le_bytes()).unwrap();
+        memory.write(0x1318, &3u64.to_le_bytes()).unwrap();
+        // msghdr（x86_64 56 字节）@0x1400：name(8)+namelen(8)+iov(8)+iovlen(8)+control(8)+controllen(8)+flags(4)
+        memory.write(0x1400, &0u64.to_le_bytes()).unwrap();
+        memory.write(0x1408, &0u64.to_le_bytes()).unwrap();
+        memory.write(0x1410, &0x1300u64.to_le_bytes()).unwrap();
+        memory.write(0x1418, &2u64.to_le_bytes()).unwrap();
+        memory.write(0x1420, &0u64.to_le_bytes()).unwrap();
+        memory.write(0x1428, &0u64.to_le_bytes()).unwrap();
+        memory.write(0x1430, &0u32.to_le_bytes()).unwrap();
+        // A 用 sendmsg 发送聚合后的 "hello"
+        let sendmsg =
+            RuntimeSyscallEvent::enter(SYS_SENDMSG, "sendmsg", [fd_a as u64, 0x1400, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&sendmsg, &mut memory).unwrap(), 5);
+        // B 用 recvmsg 接收：msghdr@0x1510（name 偏移0, namelen 偏移8, iov 偏移16, iovlen 偏移24），
+        // iov 数组@0x1500 指向 0x1600 容量 8。
+        memory.write(0x1500, &0x1600u64.to_le_bytes()).unwrap();
+        memory.write(0x1508, &8u64.to_le_bytes()).unwrap();
+        memory.write(0x1510, &0u64.to_le_bytes()).unwrap(); // msg_name=NULL
+        memory.write(0x1518, &0u64.to_le_bytes()).unwrap(); // msg_namelen=0
+        memory.write(0x1520, &0x1500u64.to_le_bytes()).unwrap(); // msg_iov=数组
+        memory.write(0x1528, &1u64.to_le_bytes()).unwrap(); // msg_iovlen=1
+        let recvmsg =
+            RuntimeSyscallEvent::enter(SYS_RECVMSG, "recvmsg", [fd_b as u64, 0x1510, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&recvmsg, &mut memory).unwrap(), 5);
+        assert_eq!(memory.read(0x1600, 5).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn sendmsg_on_unconnected_socket_returns_enotconn() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let sock = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&sock, &mut memory).unwrap();
+        // 空 msghdr（iov=0, iovlen=0）
+        memory.write(0x1400, &0u64.to_le_bytes()).unwrap();
+        memory.write(0x1408, &0u64.to_le_bytes()).unwrap();
+        memory.write(0x1410, &0u64.to_le_bytes()).unwrap();
+        memory.write(0x1418, &0u64.to_le_bytes()).unwrap();
+        let sendmsg =
+            RuntimeSyscallEvent::enter(SYS_SENDMSG, "sendmsg", [fd as u64, 0x1400, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&sendmsg, &mut memory).unwrap(),
+            -107
         );
     }
 
