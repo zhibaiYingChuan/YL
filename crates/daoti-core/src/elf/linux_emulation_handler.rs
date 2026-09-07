@@ -488,6 +488,15 @@ impl LinuxEmulationHandler {
             291 => "epoll_create1",
             233 => "epoll_ctl",
             232 => "epoll_wait",
+            41 => "socket",
+            44 => "sendto",
+            45 => "recvfrom",
+            48 => "shutdown",
+            51 => "getsockname",
+            52 => "getpeername",
+            53 => "socketpair",
+            54 => "setsockopt",
+            55 => "getsockopt",
             8 => "lseek",
             21 => "access",
             63 => "uname",
@@ -817,6 +826,15 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 291
                 | 233
                 | 232
+                | 41
+                | 44
+                | 45
+                | 48
+                | 51
+                | 52
+                | 53
+                | 54
+                | 55
                 | 8
                 | 9
                 | 10

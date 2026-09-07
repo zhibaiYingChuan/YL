@@ -61,6 +61,15 @@ pub const SYS_SELECT: u64 = 23;
 pub const SYS_EPOLL_WAIT: u64 = 232;
 pub const SYS_EPOLL_CTL: u64 = 233;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
+pub const SYS_SOCKET: u64 = 41;
+pub const SYS_SENDTO: u64 = 44;
+pub const SYS_RECVFROM: u64 = 45;
+pub const SYS_SHUTDOWN: u64 = 48;
+pub const SYS_GETSOCKNAME: u64 = 51;
+pub const SYS_GETPEERNAME: u64 = 52;
+pub const SYS_SOCKETPAIR: u64 = 53;
+pub const SYS_SETSOCKOPT: u64 = 54;
+pub const SYS_GETSOCKOPT: u64 = 55;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MADVISE: u64 = 28;
@@ -569,6 +578,21 @@ type PipeBuffer = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>
 type PipeHandle = (PipeBuffer, bool);
 type EpollRegistration = (i32, u32, u64);
 
+/// socket 状态：family/type/protocol、双向缓冲（socketpair 才连接）、方向关闭位与选项表。
+/// 与 pipe2 相同，socket fd 独立于文件 fd 编号空间维护。
+struct SocketState {
+    family: u32,
+    sock_type: u32,
+    /// 接收缓冲：我方读取，对端写入。
+    rx: Option<PipeBuffer>,
+    /// 发送缓冲：我方写入，对端读取。
+    tx: Option<PipeBuffer>,
+    /// shutdown 位：bit0=SHUT_RD 关闭，bit1=SHUT_WR 关闭。
+    shutdown: u8,
+    /// 选项表：key=(level, optname) → 原始值字节。
+    options: HashMap<(u32, u32), Vec<u8>>,
+}
+
 pub struct NativeSyscallBridge<S: OutputSink> {
     sink: S,
     observer: Option<RuntimeSyscallObserver>,
@@ -594,6 +618,8 @@ pub struct NativeSyscallBridge<S: OutputSink> {
     /// timerfd：CLOCK_MONOTONIC 下记录本次到期时刻（纳秒单调时钟）；None 表示未 arm。
     timerfds: HashMap<i32, Option<u64>>,
     epolls: HashMap<i32, Vec<EpollRegistration>>,
+    /// socket 描述符表：socket()/socketpair() 分配，sendto/recvfrom/shutdown 操作。
+    sockets: HashMap<i32, SocketState>,
     /// 目录句柄：每个条目保存宿主目录路径与下一个待返回子项序号。
     /// Linux 的 dirfd 与文件 fd 共用编号空间，这里用单独表避免改动现有文件语义。
     dirs: HashMap<i32, (PathBuf, usize)>,
@@ -650,6 +676,7 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             eventfds: HashMap::new(),
             timerfds: HashMap::new(),
             epolls: HashMap::new(),
+            sockets: HashMap::new(),
             dirs: HashMap::new(),
             next_fd: 3,
             main_ptload_ranges: Vec::new(),
@@ -995,6 +1022,7 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 || self.pipes.contains_key(&fd)
                 || self.eventfds.contains_key(&fd)
                 || self.timerfds.contains_key(&fd)
+                || self.sockets.contains_key(&fd)
                 || fd < 3
             {
                 return Ok(0);
@@ -1666,12 +1694,22 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                                 .map(|duration| duration.as_nanos() as u64 >= value)
                                 .unwrap_or(false)
                         })
+                    })
+                    || self.sockets.get(&(fd as i32)).is_some_and(|state| {
+                        state.shutdown & 0b01 == 0
+                            && state.rx.as_ref().is_some_and(|rx| {
+                                rx.lock().map(|buffer| !buffer.is_empty()).unwrap_or(false)
+                            })
                     });
                 let write_ready = fd == 1
                     || self
                         .pipes
                         .get(&(fd as i32))
-                        .is_some_and(|(_, is_write)| *is_write);
+                        .is_some_and(|(_, is_write)| *is_write)
+                    || self
+                        .sockets
+                        .get(&(fd as i32))
+                        .is_some_and(|state| state.shutdown & 0b10 == 0 && state.tx.is_some());
                 if read_wanted && read_ready {
                     let value =
                         u64::from_le_bytes(read_set[word * 8..word * 8 + 8].try_into().unwrap())
@@ -1733,6 +1771,17 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                         .map_err(|e| DaotiError::Other(format!("系统时间不可用：{e}")))?
                         .as_nanos() as u64;
                     if deadline.is_some_and(|value| now >= value) {
+                        revents |= events & 0x0001;
+                    }
+                } else if let Some(state) = self.sockets.get(&fd) {
+                    // socket：写方向未关闭即可写（POLLOUT），读缓冲非空即可读（POLLIN）。
+                    if state.shutdown & 0b10 == 0 {
+                        revents |= events & 0x0004;
+                    }
+                    let rx_readable = state.rx.as_ref().is_some_and(|rx| {
+                        rx.lock().map(|buffer| !buffer.is_empty()).unwrap_or(false)
+                    });
+                    if state.shutdown & 0b01 == 0 && rx_readable {
                         revents |= events & 0x0001;
                     }
                 } else {
@@ -1805,7 +1854,15 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                     || self
                         .timerfds
                         .get(&fd)
-                        .is_some_and(|deadline| deadline.is_some());
+                        .is_some_and(|deadline| deadline.is_some())
+                    || self.sockets.get(&fd).is_some_and(|state| {
+                        // 写方向打开即可就绪（可写）；读方向有数据也可就绪。
+                        state.shutdown & 0b10 == 0
+                            || (state.shutdown & 0b01 == 0
+                                && state.rx.as_ref().is_some_and(|rx| {
+                                    rx.lock().map(|buffer| !buffer.is_empty()).unwrap_or(false)
+                                }))
+                    });
                 if is_ready {
                     let mut raw = [0u8; 16];
                     raw[0..4].copy_from_slice(&(requested & 0x1f).to_le_bytes());
@@ -1815,6 +1872,187 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 }
             }
             return Ok(ready);
+        }
+        if event.nr == SYS_SOCKET {
+            // socket(family, type, protocol)：仅保留受控 family/type 组合，未知返回真实 -EAFNOSUPPORT。
+            let family = event.args[0];
+            let sock_type = event.args[1];
+            // AF_UNIX=1 / AF_INET=2；type 取低字节（SOCK_STREAM=1/SOCK_DGRAM=2，可带 CLOEXEC 等高位）。
+            if family != 1 && family != 2 {
+                return Ok(-97); // -EAFNOSUPPORT
+            }
+            if !matches!(sock_type & 0x1f, 1 | 2) {
+                return Ok(-22); // -EINVAL
+            }
+            let fd = self.next_fd;
+            self.next_fd += 1;
+            self.sockets.insert(
+                fd,
+                SocketState {
+                    family: family as u32,
+                    sock_type: (sock_type & 0x1f) as u32,
+                    rx: None,
+                    tx: None,
+                    shutdown: 0,
+                    options: HashMap::new(),
+                },
+            );
+            return Ok(fd as i64);
+        }
+        if event.nr == SYS_SOCKETPAIR {
+            // socketpair(family, type, protocol, sv[2])：只支持 AF_UNIX=1，
+            // 建立两条交叉共享缓冲（A写→B读、B写→A读），复用 pipe 的 VecDeque 语义。
+            let family = event.args[0];
+            if family != 1 {
+                return Ok(-97); // -EAFNOSUPPORT：Linux 仅 AF_UNIX 支持 socketpair
+            }
+            let fd_a = self.next_fd;
+            let fd_b = self.next_fd + 1;
+            self.next_fd += 2;
+            let a_to_b =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let b_to_a =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            self.sockets.insert(
+                fd_a,
+                SocketState {
+                    family: 1,
+                    sock_type: 1,
+                    rx: Some(b_to_a.clone()),
+                    tx: Some(a_to_b.clone()),
+                    shutdown: 0,
+                    options: HashMap::new(),
+                },
+            );
+            self.sockets.insert(
+                fd_b,
+                SocketState {
+                    family: 1,
+                    sock_type: 1,
+                    rx: Some(a_to_b),
+                    tx: Some(b_to_a),
+                    shutdown: 0,
+                    options: HashMap::new(),
+                },
+            );
+            let mut fds = [0u8; 8];
+            fds[..4].copy_from_slice(&(fd_a as u32).to_le_bytes());
+            fds[4..].copy_from_slice(&(fd_b as u32).to_le_bytes());
+            memory.write(event.args[3], &fds)?;
+            return Ok(0);
+        }
+        if event.nr == SYS_SHUTDOWN {
+            // shutdown(fd, how)：0=SHUT_RD，1=SHUT_WR，2=SHUT_RDWR。
+            let fd = event.args[0] as i32;
+            let how = event.args[1];
+            let Some(state) = self.sockets.get_mut(&fd) else {
+                return Ok(-9); // -EBADF
+            };
+            let bits = match how {
+                0 => 0b01,
+                1 => 0b10,
+                2 => 0b11,
+                _ => return Ok(-22), // -EINVAL
+            };
+            state.shutdown |= bits;
+            return Ok(0);
+        }
+        if event.nr == SYS_SENDTO || event.nr == SYS_RECVFROM {
+            let fd = event.args[0] as i32;
+            let buffer = event.args[1];
+            let length = event.args[2];
+            if !self.sockets.contains_key(&fd) {
+                return Ok(-9); // -EBADF
+            }
+            if event.nr == SYS_SENDTO {
+                let Some(state) = self.sockets.get_mut(&fd) else {
+                    unreachable!("已校验 sockets.contains_key");
+                };
+                if state.shutdown & 0b10 != 0 {
+                    return Ok(-32); // -EPIPE：写方向已关闭
+                }
+                let Some(tx) = state.tx.clone() else {
+                    return Ok(-107); // -ENOTCONN：未连接 socket 无法发送
+                };
+                let payload = memory.read(buffer, length)?;
+                tx.lock()
+                    .map_err(|_| DaotiError::Other("socket 发送缓冲锁中毒".into()))?
+                    .extend(payload);
+                return Ok(length as i64);
+            }
+            let Some(state) = self.sockets.get(&fd) else {
+                unreachable!("已校验 sockets.contains_key");
+            };
+            let Some(rx) = state.rx.clone() else {
+                return Ok(-11); // -EAGAIN：未连接 socket 无可读数据
+            };
+            let mut rx = rx
+                .lock()
+                .map_err(|_| DaotiError::Other("socket 接收缓冲锁中毒".into()))?;
+            let take = usize::try_from(length)
+                .map_err(|_| DaotiError::Other("socket 接收长度超出平台范围".into()))?
+                .min(rx.len());
+            if take == 0 {
+                return Ok(-11); // -EAGAIN：空读缓冲
+            }
+            let data: Vec<u8> = rx.drain(..take).collect();
+            drop(rx);
+            memory.write(buffer, &data)?;
+            return Ok(take as i64);
+        }
+        if event.nr == SYS_GETSOCKNAME || event.nr == SYS_GETPEERNAME {
+            // getsockname/getpeername(fd, sockaddr*, socklen_t*)：
+            // 回填 16 字节 sockaddr_in（family u16 + 其余零），长度指针更新为 16。
+            let fd = event.args[0] as i32;
+            let addr_ptr = event.args[1];
+            let len_ptr = event.args[2];
+            let Some(state) = self.sockets.get(&fd) else {
+                return Ok(-9); // -EBADF
+            };
+            let mut raw = [0u8; 16];
+            raw[..2].copy_from_slice(&(state.family as u16).to_le_bytes());
+            memory.write(addr_ptr, &raw)?;
+            memory.write(len_ptr, &16u32.to_le_bytes())?;
+            return Ok(0);
+        }
+        if event.nr == SYS_SETSOCKOPT || event.nr == SYS_GETSOCKOPT {
+            // setsockopt(fd, level, optname, optval, optlen)：
+            // 仅存储/回读原始字节，不假装应用任何网络策略（真实语义：选项记录存在）。
+            let fd = event.args[0] as i32;
+            let level = event.args[1] as u32;
+            let optname = event.args[2] as u32;
+            let Some(state) = self.sockets.get_mut(&fd) else {
+                return Ok(-9); // -EBADF
+            };
+            if event.nr == SYS_SETSOCKOPT {
+                let optlen = usize::try_from(event.args[4])
+                    .map_err(|_| DaotiError::Other("setsockopt 选项长度溢出".into()))?;
+                let value = memory.read(event.args[3], optlen as u64)?.to_vec();
+                state.options.insert((level, optname), value);
+            } else {
+                // SO_TYPE（SOL_SOCKET=1, optname=3）恒返回创建时的类型，与 Linux 一致。
+                let stored = if (level, optname) == (1, 3) && !state.options.contains_key(&(1, 3)) {
+                    state.sock_type.to_le_bytes().to_vec()
+                } else {
+                    state
+                        .options
+                        .get(&(level, optname))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                let len_ptr = event.args[4];
+                let capacity = usize::try_from(u32::from_le_bytes(
+                    memory
+                        .read(len_ptr, 4)?
+                        .try_into()
+                        .map_err(|_| DaotiError::Other("getsockopt 长度指针溢出".into()))?,
+                ))
+                .map_err(|_| DaotiError::Other("getsockopt 选项长度溢出".into()))?;
+                let write_len = stored.len().min(capacity);
+                memory.write(event.args[3], &stored[..write_len])?;
+                memory.write(len_ptr, &(write_len as u32).to_le_bytes())?;
+            }
+            return Ok(0);
         }
         if event.nr == SYS_PIPE2 {
             if event.args[1] & !0x80000 != 0 {
@@ -3501,6 +3739,154 @@ mod tests {
         let event = RuntimeSyscallEvent::enter(SYS_GETPID, "getpid", [0; 6]);
         assert_eq!(bridge.handle(&event).unwrap(), 1);
         assert_eq!(*seen.lock().unwrap(), vec![SYS_GETPID]);
+    }
+
+    #[test]
+    fn socket_allocs_fd_and_rejects_unknown_family() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // AF_INET=2, SOCK_STREAM=1, protocol=0 → 分配新 fd
+        let create = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&create, &mut memory).unwrap();
+        assert!(fd >= 3);
+        // 未知 family → -EAFNOSUPPORT(-97)
+        let bad = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [99, 1, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -97);
+    }
+
+    #[test]
+    fn socketpair_linked_fds_transfer_bytes_both_ways() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, fds[2]@0x1100)
+        let create =
+            RuntimeSyscallEvent::enter(SYS_SOCKETPAIR, "socketpair", [1, 1, 0, 0x1100, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&create, &mut memory).unwrap(), 0);
+        let fd_a = i64::from(u32::from_le_bytes(
+            memory.read(0x1100, 4).unwrap().try_into().unwrap(),
+        ));
+        let fd_b = i64::from(u32::from_le_bytes(
+            memory.read(0x1104, 4).unwrap().try_into().unwrap(),
+        ));
+        assert_ne!(fd_a, fd_b);
+        // A 向 B 发送 "hi"：sendto(fd_a, src, 2, flags, NULL, 0)
+        memory.write(0x1200, b"hi").unwrap();
+        let send =
+            RuntimeSyscallEvent::enter(SYS_SENDTO, "sendto", [fd_a as u64, 0x1200, 2, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&send, &mut memory).unwrap(), 2);
+        // B 接收：recvfrom(fd_b, dst, 8, 0, NULL, NULL)
+        let recv =
+            RuntimeSyscallEvent::enter(SYS_RECVFROM, "recvfrom", [fd_b as u64, 0x1300, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&recv, &mut memory).unwrap(), 2);
+        assert_eq!(memory.read(0x1300, 2).unwrap(), b"hi");
+        // 反向 B→A
+        memory.write(0x1200, b"ok").unwrap();
+        let send_b =
+            RuntimeSyscallEvent::enter(SYS_SENDTO, "sendto", [fd_b as u64, 0x1200, 2, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&send_b, &mut memory).unwrap(), 2);
+        let recv_a =
+            RuntimeSyscallEvent::enter(SYS_RECVFROM, "recvfrom", [fd_a as u64, 0x1300, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&recv_a, &mut memory).unwrap(), 2);
+        assert_eq!(memory.read(0x1300, 2).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn unconnected_socket_send_returns_real_errors() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let create = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&create, &mut memory).unwrap();
+        // 未连接 socket 发送 → -ENOTCONN(-107)
+        memory.write(0x1200, b"x").unwrap();
+        let send =
+            RuntimeSyscallEvent::enter(SYS_SENDTO, "sendto", [fd as u64, 0x1200, 1, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&send, &mut memory).unwrap(), -107);
+        // 空读缓冲 → -EAGAIN(-11)
+        let recv =
+            RuntimeSyscallEvent::enter(SYS_RECVFROM, "recvfrom", [fd as u64, 0x1300, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&recv, &mut memory).unwrap(), -11);
+        // 未知 fd → -EBADF(-9)
+        let bad = RuntimeSyscallEvent::enter(SYS_RECVFROM, "recvfrom", [1234, 0x1300, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -9);
+    }
+
+    #[test]
+    fn shutdown_marks_direction_and_blocks_transfer() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let create =
+            RuntimeSyscallEvent::enter(SYS_SOCKETPAIR, "socketpair", [1, 1, 0, 0x1100, 0, 0]);
+        bridge.handle_with_memory(&create, &mut memory).unwrap();
+        let fd_a = i64::from(u32::from_le_bytes(
+            memory.read(0x1100, 4).unwrap().try_into().unwrap(),
+        ));
+        // shutdown(fd_a, SHUT_WR=1) → A 不能再发送
+        let shutdown =
+            RuntimeSyscallEvent::enter(SYS_SHUTDOWN, "shutdown", [fd_a as u64, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&shutdown, &mut memory).unwrap(),
+            0
+        );
+        memory.write(0x1200, b"x").unwrap();
+        let send =
+            RuntimeSyscallEvent::enter(SYS_SENDTO, "sendto", [fd_a as u64, 0x1200, 1, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&send, &mut memory).unwrap(), -32); // -EPIPE
+                                                                                 // 非法 how → -EINVAL(-22)
+        let bad =
+            RuntimeSyscallEvent::enter(SYS_SHUTDOWN, "shutdown", [fd_a as u64, 7, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -22);
+    }
+
+    #[test]
+    fn default_sockaddr_has_unix_family_and_socketpair_shares_linked_state() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let create = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&create, &mut memory).unwrap();
+        // getsockname(fd, sockaddr@0x1300, len@0x1400)；sockaddr_in 前 2 字节 family
+        memory.write(0x1400, &16u32.to_le_bytes()).unwrap();
+        let name = RuntimeSyscallEvent::enter(
+            SYS_GETSOCKNAME,
+            "getsockname",
+            [fd as u64, 0x1300, 0x1400, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&name, &mut memory).unwrap(), 0);
+        assert_eq!(
+            u16::from_le_bytes(memory.read(0x1300, 2).unwrap().try_into().unwrap()),
+            2 // AF_INET 保留真实 family
+        );
+        assert_eq!(
+            u32::from_le_bytes(memory.read(0x1400, 4).unwrap().try_into().unwrap()),
+            16
+        );
+    }
+
+    #[test]
+    fn setsockopt_stores_and_getsockopt_reads_back() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let create = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&create, &mut memory).unwrap();
+        // setsockopt(fd, SOL_SOCKET=1, SO_REUSEADDR=2, val=1, len=4)
+        memory.write(0x1200, &1u32.to_le_bytes()).unwrap();
+        let set = RuntimeSyscallEvent::enter(
+            SYS_SETSOCKOPT,
+            "setsockopt",
+            [fd as u64, 1, 2, 0x1200, 4, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&set, &mut memory).unwrap(), 0);
+        // getsockopt：需要 optlen 指针回填 4
+        memory.write(0x1400, &4u32.to_le_bytes()).unwrap();
+        let get = RuntimeSyscallEvent::enter(
+            SYS_GETSOCKOPT,
+            "getsockopt",
+            [fd as u64, 1, 2, 0x1300, 0x1400, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&get, &mut memory).unwrap(), 0);
+        assert_eq!(
+            u32::from_le_bytes(memory.read(0x1300, 4).unwrap().try_into().unwrap()),
+            1
+        );
     }
 
     #[test]
