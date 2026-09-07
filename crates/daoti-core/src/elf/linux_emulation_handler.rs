@@ -822,10 +822,12 @@ impl SyscallHandler for LinuxEmulationHandler {
             0 | 3
                 | 5
                 | 7
+                | 271
                 | 23
                 | 291
                 | 233
                 | 232
+                | 281
                 | 41
                 | 42
                 | 44

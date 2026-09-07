@@ -57,8 +57,10 @@ pub const SYS_TIMERFD_CREATE: u64 = 283;
 pub const SYS_TIMERFD_SETTIME: u64 = 286;
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
 pub const SYS_POLL: u64 = 7;
+pub const SYS_PPOLL: u64 = 271;
 pub const SYS_SELECT: u64 = 23;
 pub const SYS_EPOLL_WAIT: u64 = 232;
+pub const SYS_EPOLL_PWAIT: u64 = 281;
 pub const SYS_EPOLL_CTL: u64 = 233;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
 pub const SYS_SOCKET: u64 = 41;
@@ -1745,9 +1747,9 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(ready);
         }
-        if event.nr == SYS_POLL {
-            // poll(struct pollfd *fds, nfds, timeout)：pollfd 为 fd(i32)+events(i16)+revents(i16)，共 8 字节。
-            // 当前仿真不阻塞：立即根据设备状态计算就绪事件。
+        if event.nr == SYS_POLL || event.nr == SYS_PPOLL {
+            // poll/ppoll(struct pollfd *fds, nfds, [timeout|tmo_p])：pollfd 为 fd(i32)+events(i16)+revents(i16)，共 8 字节。
+            // 当前仿真不阻塞：立即根据设备状态计算就绪事件。ppoll 的额外 sigmask 参数被接受但忽略（无信号语义）。
             let count = usize::try_from(event.args[1])
                 .map_err(|_| DaotiError::Other("poll 数量超出平台范围".into()))?;
             let mut ready = 0i64;
@@ -1843,7 +1845,9 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(0);
         }
-        if event.nr == SYS_EPOLL_WAIT {
+        if event.nr == SYS_EPOLL_WAIT || event.nr == SYS_EPOLL_PWAIT {
+            // epoll_wait/epoll_pwait(epfd, events, maxevents, [timeout|timeout,sigmask])：
+            // 与 poll 同理不阻塞；epoll_pwait 的 sigmask 额外参数被接受但忽略。
             let epfd = event.args[0] as i32;
             let output = event.args[1];
             let maxevents = usize::try_from(event.args[2])
@@ -4225,6 +4229,68 @@ mod tests {
         assert_eq!(
             u16::from_be_bytes(memory.read(0x1302, 2).unwrap().try_into().unwrap()),
             2222
+        );
+    }
+
+    #[test]
+    fn ppoll_reports_same_readiness_as_poll() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let create = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&create, &mut memory).unwrap();
+        let read_fd = u32::from_le_bytes(memory.read(0x1200, 4).unwrap().try_into().unwrap());
+        let write_fd = u32::from_le_bytes(memory.read(0x1204, 4).unwrap().try_into().unwrap());
+        memory.write(0x1100, b"x").unwrap();
+        let write =
+            RuntimeSyscallEvent::enter(SYS_WRITE, "write", [write_fd as u64, 0x1100, 1, 0, 0, 0]);
+        bridge.handle_with_memory(&write, &mut memory).unwrap();
+        // ppoll(pollfd@0x1300, 1, NULL, NULL, 0)：监听 pipe 读端 POLLIN
+        memory
+            .write(0x1300, &(read_fd as i32).to_le_bytes())
+            .unwrap();
+        memory.write(0x1304, &1u16.to_le_bytes()).unwrap();
+        memory.write(0x1306, &[0, 0]).unwrap();
+        let ppoll = RuntimeSyscallEvent::enter(SYS_PPOLL, "ppoll", [0x1300, 1, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&ppoll, &mut memory).unwrap(), 1);
+        assert_eq!(
+            u16::from_le_bytes(memory.read(0x1306, 2).unwrap().try_into().unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn epoll_pwait_returns_registered_pipe_event() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let pipe = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&pipe, &mut memory).unwrap();
+        let write_fd = u64::from(u32::from_le_bytes(
+            memory.read(0x1204, 4).unwrap().try_into().unwrap(),
+        ));
+        let epfd = bridge
+            .handle_with_memory(
+                &RuntimeSyscallEvent::enter(SYS_EPOLL_CREATE1, "epoll_create1", [0, 0, 0, 0, 0, 0]),
+                &mut memory,
+            )
+            .unwrap() as i32;
+        memory.write(0x1300, &(4u32).to_le_bytes()).unwrap();
+        memory.write(0x1308, &0x42u64.to_le_bytes()).unwrap();
+        let ctl = RuntimeSyscallEvent::enter(
+            SYS_EPOLL_CTL,
+            "epoll_ctl",
+            [epfd as u64, 1, write_fd, 0x1300, 0, 0],
+        );
+        bridge.handle_with_memory(&ctl, &mut memory).unwrap();
+        // epoll_pwait(epfd, events@0x1400, 1, -1, NULL, 0)
+        let pwait = RuntimeSyscallEvent::enter(
+            SYS_EPOLL_PWAIT,
+            "epoll_pwait",
+            [epfd as u64, 0x1400, 1, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&pwait, &mut memory).unwrap(), 1);
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1408, 8).unwrap().try_into().unwrap()),
+            0x42
         );
     }
 
