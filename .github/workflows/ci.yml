@@ -65,8 +65,8 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
-      - name: 生成 glibc 道体权重（Windows 验收前置）
-        if: runner.os == 'Windows'
+      - name: 生成 glibc 道体权重（Windows/macOS 验收前置）
+        if: runner.os == 'Windows' || runner.os == 'macOS'
         shell: pwsh
         run: |
           cargo run -p daoti-core --bin glibc-knowledge -- knowledge/glibc_knowledge.jsonl
