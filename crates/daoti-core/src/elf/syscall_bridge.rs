@@ -57,6 +57,7 @@ pub const SYS_TIMERFD_CREATE: u64 = 283;
 pub const SYS_TIMERFD_SETTIME: u64 = 286;
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
 pub const SYS_POLL: u64 = 7;
+pub const SYS_SELECT: u64 = 23;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MADVISE: u64 = 28;
@@ -1601,6 +1602,95 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(0);
         }
+        if event.nr == SYS_SELECT {
+            // select(nfds, readfds, writefds, exceptfds, timeout)：x86_64 fd_set 为 1024 位。
+            let nfds = usize::try_from(event.args[0])
+                .map_err(|_| DaotiError::Other("select nfds 超出平台范围".into()))?;
+            if nfds > 1024 {
+                return Ok(-22); // -EINVAL
+            }
+            let words = nfds.div_ceil(64);
+            let bytes_len = words * 8;
+            let read_ptr = event.args[1];
+            let write_ptr = event.args[2];
+            let mut read_set = if read_ptr != 0 {
+                memory.read(read_ptr, bytes_len as u64)?.to_vec()
+            } else {
+                vec![0; bytes_len]
+            };
+            let mut write_set = if write_ptr != 0 {
+                memory.read(write_ptr, bytes_len as u64)?.to_vec()
+            } else {
+                vec![0; bytes_len]
+            };
+            let read_requested = read_set.clone();
+            let write_requested = write_set.clone();
+            read_set.fill(0);
+            write_set.fill(0);
+            let mut ready = 0i64;
+            for fd in 0..nfds {
+                let word = fd / 64;
+                let bit = 1u64 << (fd % 64);
+                let read_wanted =
+                    u64::from_le_bytes(read_requested[word * 8..word * 8 + 8].try_into().unwrap())
+                        & bit
+                        != 0;
+                let write_wanted =
+                    u64::from_le_bytes(write_requested[word * 8..word * 8 + 8].try_into().unwrap())
+                        & bit
+                        != 0;
+                let read_ready = self
+                    .pipes
+                    .get(&(fd as i32))
+                    .is_some_and(|(shared, is_write)| {
+                        !*is_write
+                            && shared
+                                .lock()
+                                .map(|buffer| !buffer.is_empty())
+                                .unwrap_or(false)
+                    })
+                    || self
+                        .eventfds
+                        .get(&(fd as i32))
+                        .is_some_and(|value| *value > 0)
+                    || self.timerfds.get(&(fd as i32)).is_some_and(|deadline| {
+                        deadline.is_some_and(|value| {
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|duration| duration.as_nanos() as u64 >= value)
+                                .unwrap_or(false)
+                        })
+                    });
+                let write_ready = fd == 1
+                    || self
+                        .pipes
+                        .get(&(fd as i32))
+                        .is_some_and(|(_, is_write)| *is_write);
+                if read_wanted && read_ready {
+                    let value =
+                        u64::from_le_bytes(read_set[word * 8..word * 8 + 8].try_into().unwrap())
+                            | bit;
+                    read_set[word * 8..word * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                    ready += 1;
+                }
+                if write_wanted && write_ready {
+                    let value =
+                        u64::from_le_bytes(write_set[word * 8..word * 8 + 8].try_into().unwrap())
+                            | bit;
+                    write_set[word * 8..word * 8 + 8].copy_from_slice(&value.to_le_bytes());
+                    if !(read_wanted && read_ready) {
+                        ready += 1;
+                    }
+                }
+            }
+            if read_ptr != 0 {
+                memory.write(read_ptr, &read_set)?;
+            }
+            if write_ptr != 0 {
+                memory.write(write_ptr, &write_set)?;
+            }
+            return Ok(ready);
+        }
         if event.nr == SYS_POLL {
             // poll(struct pollfd *fds, nfds, timeout)：pollfd 为 fd(i32)+events(i16)+revents(i16)，共 8 字节。
             // 当前仿真不阻塞：立即根据设备状态计算就绪事件。
@@ -3139,6 +3229,58 @@ mod tests {
         let mut memory = MemoryModel::new(0x1000, 0x2000);
         let poll = RuntimeSyscallEvent::enter(SYS_POLL, "poll", [0x1800, 1, 0, 0, 0, 0]);
         assert!(bridge.handle_with_memory(&poll, &mut memory).is_err());
+    }
+
+    #[test]
+    fn select_updates_fd_sets_for_pipe_and_stdout() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        let create = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&create, &mut memory).unwrap();
+        let read_fd = u64::from(u32::from_le_bytes(
+            memory.read(0x1200, 4).unwrap().try_into().unwrap(),
+        ));
+        let write_fd = u64::from(u32::from_le_bytes(
+            memory.read(0x1204, 4).unwrap().try_into().unwrap(),
+        ));
+        memory.write(0x1100, b"x").unwrap();
+        let write = RuntimeSyscallEvent::enter(SYS_WRITE, "write", [write_fd, 0x1100, 1, 0, 0, 0]);
+        bridge.handle_with_memory(&write, &mut memory).unwrap();
+        // fd_set 的第 0 个 64 位 word：pipe 读端和 stdout 写端
+        let mut read_set = [0u8; 128];
+        let mut write_set = [0u8; 128];
+        read_set[(read_fd as usize / 8) * 8..(read_fd as usize / 8 + 1) * 8]
+            .copy_from_slice(&(1u64 << (read_fd % 64)).to_le_bytes());
+        write_set[0..8].copy_from_slice(&2u64.to_le_bytes()); // stdout fd=1
+        memory.write(0x1400, &read_set).unwrap();
+        memory.write(0x1480, &write_set).unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_SELECT,
+            "select",
+            [write_fd + 1, 0x1400, 0x1480, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 2);
+        assert_ne!(
+            u64::from_le_bytes(
+                memory
+                    .read(0x1400 + (read_fd / 8) * 8, 8)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1480, 8).unwrap().try_into().unwrap()),
+            2
+        );
     }
 
     #[test]

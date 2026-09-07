@@ -484,6 +484,7 @@ impl LinuxEmulationHandler {
             286 => "timerfd_settime",
             287 => "timerfd_gettime",
             7 => "poll",
+            23 => "select",
             8 => "lseek",
             21 => "access",
             63 => "uname",
@@ -808,6 +809,8 @@ impl SyscallHandler for LinuxEmulationHandler {
             event.nr,
             0 | 3
                 | 5
+                | 7
+                | 23
                 | 8
                 | 9
                 | 10
@@ -834,7 +837,6 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 283
                 | 286
                 | 287
-                | 7
                 | 13
                 | 14
                 | 16
