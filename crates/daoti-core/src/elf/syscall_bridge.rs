@@ -17,6 +17,7 @@ pub const SYS_WRITE: u64 = 1;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_FCNTL: u64 = 72;
 pub const SYS_ACCESS: u64 = 21;
+pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_UNLINKAT: u64 = 263;
@@ -949,10 +950,26 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 event.name, event.nr, event.args, self.current_brk, self.heap_end
             );
         }
-        if event.nr == SYS_ACCESS {
+        if event.nr == SYS_ACCESS || event.nr == SYS_FACCESSAT {
+            if event.nr == SYS_FACCESSAT {
+                // faccessat(dirfd, pathname, mode, flags)：仅支持 AT_FDCWD(-100)
+                // 与其他 at 系列一致；flags 仅接受 0，未知 dirfd 返回 -EBADF。
+                let dirfd = event.args[0] as i64;
+                if dirfd != -100 {
+                    return Ok(-9); // -EBADF
+                }
+                if event.args[3] != 0 {
+                    return Ok(-22); // -EINVAL（不支持 AT_EACCESS 等标志）
+                }
+            }
+            let path_ptr = if event.nr == SYS_FACCESSAT {
+                event.args[1]
+            } else {
+                event.args[0]
+            };
             let mut raw = Vec::new();
             for index in 0..4096u64 {
-                let byte = memory.read(event.args[0] + index, 1)?[0];
+                let byte = memory.read(path_ptr + index, 1)?[0];
                 if byte == 0 {
                     break;
                 }
@@ -965,7 +982,11 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             let Some(candidate) = self.resolve_guest_path(path) else {
                 return Ok(-2);
             };
-            let mode = event.args[1];
+            let mode = if event.nr == SYS_FACCESSAT {
+                event.args[2]
+            } else {
+                event.args[1]
+            };
             if mode & 4 != 0 && std::fs::metadata(&candidate).is_err() {
                 return Ok(-13);
             }
@@ -3904,6 +3925,43 @@ mod tests {
         let mut bridge = NativeSyscallBridge::new(BufferSink::default());
         let event = RuntimeSyscallEvent::enter(SYS_ACCESS, "access", [0x1000, 0, 0, 0, 0, 0]);
         assert_eq!(bridge.handle(&event).unwrap(), -2);
+    }
+
+    #[test]
+    fn faccessat_reuses_sandbox_access_semantics() {
+        let root = std::env::temp_dir().join(format!("daoti-faccessat-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("probe"), b"ok").unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1200, b"/probe\0").unwrap();
+        let readable = RuntimeSyscallEvent::enter(
+            SYS_FACCESSAT,
+            "faccessat",
+            [u64::MAX - 99, 0x1200, 4, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&readable, &mut memory).unwrap(),
+            0
+        );
+        memory.write(0x1240, b"/missing\0").unwrap();
+        let missing = RuntimeSyscallEvent::enter(
+            SYS_FACCESSAT,
+            "faccessat",
+            [u64::MAX - 99, 0x1240, 4, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&missing, &mut memory).unwrap(),
+            -2
+        );
+        let bad_dirfd =
+            RuntimeSyscallEvent::enter(SYS_FACCESSAT, "faccessat", [3, 0x1200, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&bad_dirfd, &mut memory).unwrap(),
+            -9
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
