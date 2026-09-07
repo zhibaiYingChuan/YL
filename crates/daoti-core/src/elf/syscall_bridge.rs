@@ -62,14 +62,18 @@ pub const SYS_EPOLL_WAIT: u64 = 232;
 pub const SYS_EPOLL_CTL: u64 = 233;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
 pub const SYS_SOCKET: u64 = 41;
+pub const SYS_CONNECT: u64 = 42;
 pub const SYS_SENDTO: u64 = 44;
 pub const SYS_RECVFROM: u64 = 45;
 pub const SYS_SHUTDOWN: u64 = 48;
+pub const SYS_BIND: u64 = 49;
+pub const SYS_LISTEN: u64 = 50;
 pub const SYS_GETSOCKNAME: u64 = 51;
 pub const SYS_GETPEERNAME: u64 = 52;
 pub const SYS_SOCKETPAIR: u64 = 53;
 pub const SYS_SETSOCKOPT: u64 = 54;
 pub const SYS_GETSOCKOPT: u64 = 55;
+pub const SYS_ACCEPT4: u64 = 288;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MADVISE: u64 = 28;
@@ -591,6 +595,12 @@ struct SocketState {
     shutdown: u8,
     /// 选项表：key=(level, optname) → 原始值字节。
     options: HashMap<(u32, u32), Vec<u8>>,
+    /// bind 设置的本地端口（网络字节序大端），None = 未绑定。
+    bound_port: Option<u16>,
+    /// listen 是否已进入监听状态。
+    listening: bool,
+    /// 待 accept 的连接队列：每项为 (client_to_server, server_to_client) 双向缓冲。
+    pending: std::collections::VecDeque<(PipeBuffer, PipeBuffer)>,
 }
 
 pub struct NativeSyscallBridge<S: OutputSink> {
@@ -1895,6 +1905,9 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                     tx: None,
                     shutdown: 0,
                     options: HashMap::new(),
+                    bound_port: None,
+                    listening: false,
+                    pending: std::collections::VecDeque::new(),
                 },
             );
             return Ok(fd as i64);
@@ -1922,6 +1935,9 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                     tx: Some(a_to_b.clone()),
                     shutdown: 0,
                     options: HashMap::new(),
+                    bound_port: None,
+                    listening: false,
+                    pending: std::collections::VecDeque::new(),
                 },
             );
             self.sockets.insert(
@@ -1933,6 +1949,9 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                     tx: Some(b_to_a),
                     shutdown: 0,
                     options: HashMap::new(),
+                    bound_port: None,
+                    listening: false,
+                    pending: std::collections::VecDeque::new(),
                 },
             );
             let mut fds = [0u8; 8];
@@ -1956,6 +1975,149 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             };
             state.shutdown |= bits;
             return Ok(0);
+        }
+        match event.nr {
+            SYS_BIND => {
+                // bind(fd, sockaddr*, addrlen)：解析 sockaddr_in 的 family/port（port 网络字节序大端），
+                // 记录绑定端口；端口已占用或 family 不符返回真实错误。
+                let fd = event.args[0] as i32;
+                let addr_ptr = event.args[1];
+                let addrlen = event.args[2];
+                if !self.sockets.contains_key(&fd) {
+                    return Ok(-9); // -EBADF
+                }
+                if addrlen < 8 {
+                    return Ok(-22); // -EINVAL：sockaddr_in 至少 8 字节
+                }
+                let raw = memory.read(addr_ptr, 8)?;
+                let family = u16::from_le_bytes(raw[0..2].try_into().unwrap());
+                let port = u16::from_be_bytes(raw[2..4].try_into().unwrap());
+                let state_family = self.sockets.get(&fd).map(|s| s.family).unwrap_or(0);
+                if family as u32 != state_family {
+                    return Ok(-22); // -EINVAL：family 与创建时不一致
+                }
+                // 同 family+port 已被其他 listener 绑定 → -EADDRINUSE(-98)
+                if self.sockets.iter().any(|(other, candidate)| {
+                    *other != fd
+                        && candidate.family == state_family
+                        && candidate.bound_port == Some(port)
+                }) {
+                    return Ok(-98);
+                }
+                self.sockets.get_mut(&fd).unwrap().bound_port = Some(port);
+                return Ok(0);
+            }
+            SYS_LISTEN => {
+                // listen(fd, backlog)：进入监听状态；未绑定端口也允许（内核自动绑定，此处保持 None）。
+                let fd = event.args[0] as i32;
+                let Some(state) = self.sockets.get_mut(&fd) else {
+                    return Ok(-9); // -EBADF
+                };
+                state.listening = true;
+                return Ok(0);
+            }
+            SYS_CONNECT => {
+                // connect(fd, sockaddr*, addrlen)：在本 bridge 的 sockets 表内查找
+                // family/port 匹配且处于监听状态的 socket（受控回环仿真）；
+                // 找到则建立双向共享缓冲并加入其对端队列，返回 0；
+                // 否则返回 -ECONNREFUSED(-111)，与"无进程监听该端口"的真实行为一致。
+                let fd = event.args[0] as i32;
+                let addr_ptr = event.args[1];
+                let addrlen = event.args[2];
+                if !self.sockets.contains_key(&fd) {
+                    return Ok(-9); // -EBADF
+                }
+                if addrlen < 8 {
+                    return Ok(-22); // -EINVAL
+                }
+                let raw = memory.read(addr_ptr, 8)?;
+                let family = u16::from_le_bytes(raw[0..2].try_into().unwrap());
+                let port = u16::from_be_bytes(raw[2..4].try_into().unwrap());
+                let client_family = self.sockets.get(&fd).map(|s| s.family).unwrap_or(0);
+                if family as u32 != client_family {
+                    return Ok(-22); // -EINVAL：family 不匹配
+                }
+                if self.sockets.get(&fd).is_some_and(|s| s.listening) {
+                    return Ok(-22); // -EINVAL：监听端不能作为连接发起端
+                }
+                // 查找监听端（family+port 匹配的 listening socket）。
+                let Some(server_fd) = self.sockets.iter().find_map(|(&candidate_fd, candidate)| {
+                    (candidate.family == client_family
+                        && candidate.listening
+                        && candidate.bound_port == Some(port))
+                    .then_some(candidate_fd)
+                }) else {
+                    return Ok(-111); // -ECONNREFUSED
+                };
+                // 建立两条交叉共享缓冲：client→server（client 写、server 读）、
+                // server→client（client 读、server 写）。
+                let client_to_server =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+                let server_to_client =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+                let client = self.sockets.get_mut(&fd).unwrap();
+                client.rx = Some(server_to_client.clone());
+                client.tx = Some(client_to_server.clone());
+                // 服务端读 client 写来的缓冲；服务端写 client 读的缓冲。
+                let client_to_server_clone = client_to_server.clone();
+                let server_to_client_clone = server_to_client.clone();
+                self.sockets
+                    .get_mut(&server_fd)
+                    .ok_or_else(|| DaotiError::Other("connect 目标已消失".into()))?
+                    .pending
+                    .push_back((client_to_server_clone, server_to_client_clone));
+                return Ok(0);
+            }
+            SYS_ACCEPT4 => {
+                // accept4(fd, sockaddr*, socklen_t*, flags)：从监听队列弹出一个连接，
+                // 新 fd 的 rx=client_to_server、tx=server_to_client；队列空 → -EAGAIN(-11)。
+                let fd = event.args[0] as i32;
+                let addr_ptr = event.args[1];
+                let len_ptr = event.args[2];
+                let flags = event.args[3];
+                let Some(state) = self.sockets.get_mut(&fd) else {
+                    return Ok(-9); // -EBADF
+                };
+                if !state.listening {
+                    return Ok(-22); // -EINVAL：非监听 socket 不可 accept
+                }
+                if flags & !0x00080000 != 0 {
+                    return Ok(-22); // -EINVAL：仅接受 SOCK_CLOEXEC
+                }
+                let Some((client_to_server, server_to_client)) = state.pending.pop_front() else {
+                    return Ok(-11); // -EAGAIN：无待接受连接
+                };
+                let accepted_family = state.family;
+                let accepted_type = state.sock_type;
+                let _ = state;
+                let accepted = self.next_fd;
+                self.next_fd += 1;
+                self.sockets.insert(
+                    accepted,
+                    SocketState {
+                        family: accepted_family,
+                        sock_type: accepted_type,
+                        rx: Some(client_to_server),
+                        tx: Some(server_to_client),
+                        shutdown: 0,
+                        options: HashMap::new(),
+                        bound_port: None,
+                        listening: false,
+                        pending: std::collections::VecDeque::new(),
+                    },
+                );
+                // 回填对端地址：family + 端口 + 长度 = 16。
+                if addr_ptr != 0 {
+                    let mut raw = [0u8; 16];
+                    raw[..2].copy_from_slice(&(accepted_family as u16).to_le_bytes());
+                    memory.write(addr_ptr, &raw)?;
+                    if len_ptr != 0 {
+                        memory.write(len_ptr, &16u32.to_le_bytes())?;
+                    }
+                }
+                return Ok(accepted as i64);
+            }
+            _ => {}
         }
         if event.nr == SYS_SENDTO || event.nr == SYS_RECVFROM {
             let fd = event.args[0] as i32;
@@ -2002,7 +2164,8 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
         }
         if event.nr == SYS_GETSOCKNAME || event.nr == SYS_GETPEERNAME {
             // getsockname/getpeername(fd, sockaddr*, socklen_t*)：
-            // 回填 16 字节 sockaddr_in（family u16 + 其余零），长度指针更新为 16。
+            // 回填 16 字节 sockaddr_in（family u16 + port u16 大端 + 其余零），
+            // getsockname 报告本机绑定端口（未绑定为 0），长度指针更新为 16。
             let fd = event.args[0] as i32;
             let addr_ptr = event.args[1];
             let len_ptr = event.args[2];
@@ -2011,6 +2174,11 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             };
             let mut raw = [0u8; 16];
             raw[..2].copy_from_slice(&(state.family as u16).to_le_bytes());
+            if event.nr == SYS_GETSOCKNAME {
+                if let Some(port) = state.bound_port {
+                    raw[2..4].copy_from_slice(&port.to_be_bytes());
+                }
+            }
             memory.write(addr_ptr, &raw)?;
             memory.write(len_ptr, &16u32.to_le_bytes())?;
             return Ok(0);
@@ -3886,6 +4054,177 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(memory.read(0x1300, 4).unwrap().try_into().unwrap()),
             1
+        );
+    }
+
+    #[test]
+    fn bind_listen_connect_accept4_establishes_loopback_stream() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // 服务端：socket(AF_INET=2, SOCK_STREAM=1) → bind(端口 8080 大端 0x1f90) → listen
+        let listen_sock = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let server = bridge
+            .handle_with_memory(&listen_sock, &mut memory)
+            .unwrap();
+        // sockaddr_in：family(2 字节小端=2) + port(2 字节大端=8080) + addr(4) + 填充
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sockaddr[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        memory.write(0x1500, &sockaddr).unwrap();
+        let bind =
+            RuntimeSyscallEvent::enter(SYS_BIND, "bind", [server as u64, 0x1500, 16, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bind, &mut memory).unwrap(), 0);
+        let listen =
+            RuntimeSyscallEvent::enter(SYS_LISTEN, "listen", [server as u64, 8, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&listen, &mut memory).unwrap(), 0);
+        // 客户端：socket + connect 到 8080
+        let client_sock = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let client = bridge
+            .handle_with_memory(&client_sock, &mut memory)
+            .unwrap();
+        let connect = RuntimeSyscallEvent::enter(
+            SYS_CONNECT,
+            "connect",
+            [client as u64, 0x1500, 16, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&connect, &mut memory).unwrap(), 0);
+        // accept4 返回连接好的新 fd
+        memory.write(0x1600, &16u32.to_le_bytes()).unwrap();
+        let accept = RuntimeSyscallEvent::enter(
+            SYS_ACCEPT4,
+            "accept4",
+            [server as u64, 0x1700, 0x1600, 0, 0, 0],
+        );
+        let conn = bridge.handle_with_memory(&accept, &mut memory).unwrap();
+        assert!(conn >= 3);
+        assert_eq!(
+            u32::from_le_bytes(memory.read(0x1600, 4).unwrap().try_into().unwrap()),
+            16
+        );
+        // 客户端 → 服务端：sendto(client,"hi") → recvfrom(conn)
+        memory.write(0x1200, b"hi").unwrap();
+        let send =
+            RuntimeSyscallEvent::enter(SYS_SENDTO, "sendto", [client as u64, 0x1200, 2, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&send, &mut memory).unwrap(), 2);
+        let recv =
+            RuntimeSyscallEvent::enter(SYS_RECVFROM, "recvfrom", [conn as u64, 0x1300, 8, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&recv, &mut memory).unwrap(), 2);
+        assert_eq!(memory.read(0x1300, 2).unwrap(), b"hi");
+        // 服务端 → 客户端：sendto(conn,"ok") → recvfrom(client)
+        memory.write(0x1200, b"ok").unwrap();
+        let send_back =
+            RuntimeSyscallEvent::enter(SYS_SENDTO, "sendto", [conn as u64, 0x1200, 2, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&send_back, &mut memory).unwrap(),
+            2
+        );
+        let recv_back = RuntimeSyscallEvent::enter(
+            SYS_RECVFROM,
+            "recvfrom",
+            [client as u64, 0x1300, 8, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&recv_back, &mut memory).unwrap(),
+            2
+        );
+        assert_eq!(memory.read(0x1300, 2).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn connect_to_unbound_port_returns_ecnrefused() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let client_sock = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let client = bridge
+            .handle_with_memory(&client_sock, &mut memory)
+            .unwrap();
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sockaddr[2..4].copy_from_slice(&9999u16.to_be_bytes());
+        memory.write(0x1500, &sockaddr).unwrap();
+        let connect = RuntimeSyscallEvent::enter(
+            SYS_CONNECT,
+            "connect",
+            [client as u64, 0x1500, 16, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&connect, &mut memory).unwrap(),
+            -111
+        );
+    }
+
+    #[test]
+    fn bind_rejects_conflict_and_listen_rejects_unknown_fd() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let sock = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&sock, &mut memory).unwrap();
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sockaddr[2..4].copy_from_slice(&8888u16.to_be_bytes());
+        memory.write(0x1500, &sockaddr).unwrap();
+        let bind = RuntimeSyscallEvent::enter(SYS_BIND, "bind", [fd as u64, 0x1500, 16, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bind, &mut memory).unwrap(), 0);
+        // 第二个 socket 绑定同一端口 → -EADDRINUSE(-98)
+        let sock2 = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd2 = bridge.handle_with_memory(&sock2, &mut memory).unwrap();
+        let bind2 = RuntimeSyscallEvent::enter(SYS_BIND, "bind", [fd2 as u64, 0x1500, 16, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bind2, &mut memory).unwrap(), -98);
+        // listen 未知 fd → -EBADF(-9)
+        let bad_listen = RuntimeSyscallEvent::enter(SYS_LISTEN, "listen", [1234, 8, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&bad_listen, &mut memory).unwrap(),
+            -9
+        );
+    }
+
+    #[test]
+    fn accept4_empty_queue_returns_eagain() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let sock = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&sock, &mut memory).unwrap();
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sockaddr[2..4].copy_from_slice(&7777u16.to_be_bytes());
+        memory.write(0x1500, &sockaddr).unwrap();
+        let bind = RuntimeSyscallEvent::enter(SYS_BIND, "bind", [fd as u64, 0x1500, 16, 0, 0, 0]);
+        bridge.handle_with_memory(&bind, &mut memory).unwrap();
+        let listen = RuntimeSyscallEvent::enter(SYS_LISTEN, "listen", [fd as u64, 8, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&listen, &mut memory).unwrap();
+        let accept = RuntimeSyscallEvent::enter(
+            SYS_ACCEPT4,
+            "accept4",
+            [fd as u64, 0x1700, 0x1600, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&accept, &mut memory).unwrap(),
+            -11
+        );
+    }
+
+    #[test]
+    fn getsockname_reports_bound_port() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let sock = RuntimeSyscallEvent::enter(SYS_SOCKET, "socket", [2, 1, 0, 0, 0, 0]);
+        let fd = bridge.handle_with_memory(&sock, &mut memory).unwrap();
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sockaddr[2..4].copy_from_slice(&2222u16.to_be_bytes());
+        memory.write(0x1500, &sockaddr).unwrap();
+        let bind = RuntimeSyscallEvent::enter(SYS_BIND, "bind", [fd as u64, 0x1500, 16, 0, 0, 0]);
+        bridge.handle_with_memory(&bind, &mut memory).unwrap();
+        memory.write(0x1400, &16u32.to_le_bytes()).unwrap();
+        let name = RuntimeSyscallEvent::enter(
+            SYS_GETSOCKNAME,
+            "getsockname",
+            [fd as u64, 0x1300, 0x1400, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&name, &mut memory).unwrap(), 0);
+        assert_eq!(
+            u16::from_be_bytes(memory.read(0x1302, 2).unwrap().try_into().unwrap()),
+            2222
         );
     }
 
