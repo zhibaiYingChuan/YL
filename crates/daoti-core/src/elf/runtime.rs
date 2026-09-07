@@ -1114,6 +1114,26 @@ mod memory_model_tests {
     }
 
     #[test]
+    fn infinite_loop_hits_configured_step_limit_without_hanging() {
+        let mut memory = MemoryModel::new(0x1000, 0x3000);
+        memory
+            .add_region(MemoryRegion::with_data(0x1000, MemPerm::rwx(), {
+                // jmp $-2 原地自循环；后续 hlt 不应被执行。
+                let mut bytes = vec![0xeb, 0xfe, 0xf4];
+                bytes.resize(0x1000, 0x90);
+                bytes
+            }))
+            .unwrap();
+        let context = RuntimeContext::new(0x1000, 0x2000, memory);
+        let mut interpreter = X86_64Interpreter::new(context).with_max_steps(8);
+        let error = interpreter
+            .run()
+            .expect_err("无限循环必须触发步数上限而非挂起");
+        assert!(format!("{error}").contains("执行步数上限"));
+        assert_eq!(interpreter.context.state, ExecutionState::Running);
+    }
+
+    #[test]
     fn movlpd_load_preserves_high_xmm_lane() {
         let mut memory = MemoryModel::new(0x1000, 0x3000);
         memory
@@ -1550,6 +1570,8 @@ pub struct X86_64Interpreter<'a> {
     pending_l_info_init: bool,
     link_map_initializer: Option<LinkMapInitializer<'a>>,
     link_map_object_initializer: Option<LinkMapObjectInitializer<'a>>,
+    /// 单次 run 的最大指令步数；默认 10M，测试可降低以验证卡死兜底。
+    max_steps: u64,
 }
 
 impl<'a> X86_64Interpreter<'a> {
@@ -1576,7 +1598,15 @@ impl<'a> X86_64Interpreter<'a> {
             pending_l_info_init: false,
             link_map_initializer: None,
             link_map_object_initializer: None,
+            max_steps: 10_000_000,
         }
+    }
+
+    /// 限制单次 `run` 的最大指令步数（超限返回明确错误，防止卡死）。
+    /// 默认 10M 步，与历史行为一致；测试可用小值验证超时兜底路径。
+    pub fn with_max_steps(mut self, max_steps: u64) -> Self {
+        self.max_steps = max_steps;
+        self
     }
 
     pub fn with_load_bias(mut self, load_bias: u64) -> Self {
@@ -1934,8 +1964,11 @@ impl<'a> X86_64Interpreter<'a> {
             }
 
             steps += 1;
-            if steps > 10_000_000 {
-                return Err(DaotiError::Other("解释器达到执行步数上限 (10M)".into()));
+            if steps > self.max_steps {
+                return Err(DaotiError::Other(format!(
+                    "解释器达到执行步数上限 ({} 步)",
+                    self.max_steps
+                )));
             }
             let rip = self.context.registers.general.rip;
             // glibc 早期 dl_main 会调用 __rtld_mutex_init（dl-mutex.c:44），其中
