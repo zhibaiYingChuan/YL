@@ -58,6 +58,9 @@ pub const SYS_TIMERFD_SETTIME: u64 = 286;
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
 pub const SYS_POLL: u64 = 7;
 pub const SYS_SELECT: u64 = 23;
+pub const SYS_EPOLL_WAIT: u64 = 232;
+pub const SYS_EPOLL_CTL: u64 = 233;
+pub const SYS_EPOLL_CREATE1: u64 = 291;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MADVISE: u64 = 28;
@@ -564,6 +567,7 @@ pub fn shadow_inference_observer(
 
 type PipeBuffer = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>;
 type PipeHandle = (PipeBuffer, bool);
+type EpollRegistration = (i32, u32, u64);
 
 pub struct NativeSyscallBridge<S: OutputSink> {
     sink: S,
@@ -589,6 +593,7 @@ pub struct NativeSyscallBridge<S: OutputSink> {
     eventfds: HashMap<i32, u64>,
     /// timerfd：CLOCK_MONOTONIC 下记录本次到期时刻（纳秒单调时钟）；None 表示未 arm。
     timerfds: HashMap<i32, Option<u64>>,
+    epolls: HashMap<i32, Vec<EpollRegistration>>,
     /// 目录句柄：每个条目保存宿主目录路径与下一个待返回子项序号。
     /// Linux 的 dirfd 与文件 fd 共用编号空间，这里用单独表避免改动现有文件语义。
     dirs: HashMap<i32, (PathBuf, usize)>,
@@ -644,6 +649,7 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             pipes: HashMap::new(),
             eventfds: HashMap::new(),
             timerfds: HashMap::new(),
+            epolls: HashMap::new(),
             dirs: HashMap::new(),
             next_fd: 3,
             main_ptload_ranges: Vec::new(),
@@ -1734,6 +1740,77 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 }
                 memory.write(address + 6, &revents.to_le_bytes())?;
                 if revents != 0 {
+                    ready += 1;
+                }
+            }
+            return Ok(ready);
+        }
+        if event.nr == SYS_EPOLL_CREATE1 {
+            if event.args[0] & !0x80000 != 0 {
+                return Ok(-22);
+            }
+            let fd = self.next_fd;
+            self.next_fd += 1;
+            self.epolls.insert(fd, Vec::new());
+            return Ok(fd as i64);
+        }
+        if event.nr == SYS_EPOLL_CTL {
+            let epfd = event.args[0] as i32;
+            let operation = event.args[1];
+            let target = event.args[2] as i32;
+            let registrations = self
+                .epolls
+                .get_mut(&epfd)
+                .ok_or_else(|| DaotiError::Other("无效 epoll fd".into()))?;
+            match operation {
+                1 | 3 => {
+                    let raw = memory.read(event.args[3], 16)?;
+                    let events = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+                    let data = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+                    if operation == 1 {
+                        registrations.push((target, events, data));
+                    } else if let Some(item) =
+                        registrations.iter_mut().find(|item| item.0 == target)
+                    {
+                        *item = (target, events, data);
+                    } else {
+                        return Ok(-2);
+                    }
+                }
+                2 => {
+                    registrations.retain(|item| item.0 != target);
+                }
+                _ => return Ok(-22),
+            }
+            return Ok(0);
+        }
+        if event.nr == SYS_EPOLL_WAIT {
+            let epfd = event.args[0] as i32;
+            let output = event.args[1];
+            let maxevents = usize::try_from(event.args[2])
+                .map_err(|_| DaotiError::Other("epoll maxevents 溢出".into()))?;
+            if maxevents == 0 {
+                return Ok(-22);
+            }
+            let registrations = self
+                .epolls
+                .get(&epfd)
+                .ok_or_else(|| DaotiError::Other("无效 epoll fd".into()))?
+                .clone();
+            let mut ready = 0i64;
+            for (fd, requested, data) in registrations.into_iter().take(maxevents) {
+                let is_ready = fd == 1
+                    || self.pipes.get(&fd).is_some_and(|(_, write)| *write)
+                    || self.eventfds.get(&fd).is_some_and(|value| *value > 0)
+                    || self
+                        .timerfds
+                        .get(&fd)
+                        .is_some_and(|deadline| deadline.is_some());
+                if is_ready {
+                    let mut raw = [0u8; 16];
+                    raw[0..4].copy_from_slice(&(requested & 0x1f).to_le_bytes());
+                    raw[8..16].copy_from_slice(&data.to_le_bytes());
+                    memory.write(output + (ready as u64) * 16, &raw)?;
                     ready += 1;
                 }
             }
@@ -3280,6 +3357,48 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(memory.read(0x1480, 8).unwrap().try_into().unwrap()),
             2
+        );
+    }
+
+    #[test]
+    fn epoll_registers_pipe_write_end_and_returns_event() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = MemoryModel::new(0x1000, 0x9000);
+        memory
+            .add_region(MemoryRegion::with_data(
+                0x1000,
+                MemPerm::rw(),
+                vec![0; 0x1000],
+            ))
+            .unwrap();
+        let pipe = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&pipe, &mut memory).unwrap();
+        let write_fd = u64::from(u32::from_le_bytes(
+            memory.read(0x1204, 4).unwrap().try_into().unwrap(),
+        ));
+        let epfd = bridge
+            .handle_with_memory(
+                &RuntimeSyscallEvent::enter(SYS_EPOLL_CREATE1, "epoll_create1", [0, 0, 0, 0, 0, 0]),
+                &mut memory,
+            )
+            .unwrap() as i32;
+        memory.write(0x1300, &(4u32).to_le_bytes()).unwrap();
+        memory.write(0x1308, &0x55u64.to_le_bytes()).unwrap();
+        let ctl = RuntimeSyscallEvent::enter(
+            SYS_EPOLL_CTL,
+            "epoll_ctl",
+            [epfd as u64, 1, write_fd, 0x1300, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&ctl, &mut memory).unwrap(), 0);
+        let wait = RuntimeSyscallEvent::enter(
+            SYS_EPOLL_WAIT,
+            "epoll_wait",
+            [epfd as u64, 0x1400, 1, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&wait, &mut memory).unwrap(), 1);
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1408, 8).unwrap().try_into().unwrap()),
+            0x55
         );
     }
 

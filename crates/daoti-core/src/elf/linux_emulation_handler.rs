@@ -485,6 +485,9 @@ impl LinuxEmulationHandler {
             287 => "timerfd_gettime",
             7 => "poll",
             23 => "select",
+            291 => "epoll_create1",
+            233 => "epoll_ctl",
+            232 => "epoll_wait",
             8 => "lseek",
             21 => "access",
             63 => "uname",
@@ -811,6 +814,9 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 5
                 | 7
                 | 23
+                | 291
+                | 233
+                | 232
                 | 8
                 | 9
                 | 10
