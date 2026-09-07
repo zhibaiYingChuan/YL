@@ -51,8 +51,8 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/build-et-dyn-fixture.sh
-      - name: 生成真实 ET_DYN fixture（Windows，Zig 交叉工具链）
-        if: runner.os == 'Windows'
+      - name: 生成真实 ET_DYN fixture（Windows/macOS，Zig 交叉工具链）
+        if: runner.os == 'Windows' || runner.os == 'macOS'
         shell: pwsh
         run: |
           zig cc -target x86_64-linux -c -fPIC -nostdlib -o target/et_dyn_console_fixture.o tests/fixtures/et_dyn_console.S
@@ -60,7 +60,7 @@ jobs:
           zig cc -target x86_64-linux -nostdlib -pie '-Wl,--build-id=none' '-Wl,-e,_start' -o target/et_dyn_console_fixture target/et_dyn_console_fixture.o
           if ($LASTEXITCODE -ne 0) { throw 'zig cc 链接 ET_DYN fixture 失败' }
           Remove-Item -LiteralPath target/et_dyn_console_fixture.o -Force -ErrorAction SilentlyContinue
-          if (-not (Test-Path -LiteralPath "${{ github.workspace }}\target\et_dyn_console_fixture")) { throw 'Zig 未产出 ET_DYN fixture' }
+          if (-not (Test-Path -LiteralPath "${{ github.workspace }}/target/et_dyn_console_fixture")) { throw 'Zig 未产出 ET_DYN fixture' }
       - name: 生成 glibc 道体权重（Linux 验收前置）
         if: runner.os == 'Linux'
         shell: bash
@@ -147,28 +147,34 @@ jobs:
             target/libc.so.6
           if-no-files-found: ignore
 
-      - name: Windows CLI 验收真实动态 ELF fixture
-        if: runner.os == 'Windows'
+      - name: CLI 验收真实动态 ELF fixture（Windows/macOS 诊断路径与失败语义）
+        if: runner.os == 'Windows' || runner.os == 'macOS'
         shell: pwsh
         env:
           DAOTI_DYNAMIC_RUNTIME_ROOT: ${{ github.workspace }}
-          DAOTI_DYNAMIC_RUNTIME_FIXTURE: ${{ github.workspace }}\target\et_dyn_console_fixture
+          DAOTI_DYNAMIC_RUNTIME_FIXTURE: ${{ github.workspace }}/target/et_dyn_console_fixture
           DAOTI_DYNAMIC_RUNTIME_EVIDENCE: passed
+          DAOTI_DYNAMIC_RUNTIME_FIXTURE_EVIDENCE: "x86_64 cross-host dynamic elf"
         run: |
           $ErrorActionPreference = 'Stop'
-          $logPath = 'target/windows-dynamic-cli.log'
+          $logPath = 'target/cross-host-dynamic-cli.log'
           cargo run -p daoti-cli -- run $env:DAOTI_DYNAMIC_RUNTIME_FIXTURE *> $logPath
           $cliExitCode = $LASTEXITCODE
           Get-Content -LiteralPath $logPath -Encoding UTF8
-          if ($cliExitCode -ne 0) { throw "Windows 动态 ELF CLI 失败，退出码=$cliExitCode；详见 $logPath" }
+          if ($cliExitCode -ne 0) { throw "跨宿主动态 ELF CLI 失败，退出码=$cliExitCode；详见 $logPath" }
+          # dynamic-metadata 诊断路径：不执行入口，仅输出解析/规划证据（非空 JSON 状态 ok）。
+          cargo run -p daoti-cli -- dynamic-metadata $env:DAOTI_DYNAMIC_RUNTIME_FIXTURE 2>&1 | Select-String -Pattern '"status":"ok"'
+          if ($LASTEXITCODE -ne 0) { throw 'dynamic-metadata 未输出 status ok 诊断证据' }
           cargo test -p daoti-cli --test cli_smoke --no-default-features -- --nocapture
-          if ($LASTEXITCODE -ne 0) { throw 'Windows 动态 ELF smoke 测试失败' }
-      - name: 上传 Windows 动态 ELF 诊断日志
-        if: runner.os == 'Windows' && always()
+          if ($LASTEXITCODE -ne 0) { throw '跨宿主动态 ELF smoke 测试失败' }
+      - name: 上传跨宿主动态 ELF 诊断日志
+        if: (runner.os == 'Windows' || runner.os == 'macOS') && always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-dynamic-elf-diagnostics
-          path: target/windows-dynamic-cli.log
+          name: cross-host-dynamic-elf-diagnostics-${{ runner.os }}
+          path: |
+            target/cross-host-dynamic-cli.log
+            target/et_dyn_console_fixture
           if-no-files-found: ignore
       - name: Linux CLI 验收真实 ET_DYN fixture
         if: runner.os == 'Linux'
