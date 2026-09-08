@@ -56,6 +56,7 @@ pub const SYS_SETSID: u64 = 112;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_WRITEV: u64 = 20;
+pub const SYS_READV: u64 = 19;
 pub const SYS_PIPE2: u64 = 293;
 pub const SYS_EVENTFD2: u64 = 290;
 pub const SYS_TIMERFD_CREATE: u64 = 283;
@@ -2932,26 +2933,136 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             return Ok(0);
         }
         if event.nr == SYS_WRITEV {
+            // writev(fd, iov, iovcnt)：聚合全部 iovec 段后，按与 write 相同的
+            // 后端分派（pipe 写端扩展、eventfd 累加、socket 发送缓冲、stdout/stderr）。
+            // 真实语义：未连接的 socket 写返回 -ENOTCONN，方向关闭返回 -EPIPE。
             let fd = event.args[0];
-            if fd != 1 && fd != 2 {
-                return Err(DaotiError::Unavailable(format!(
-                    "writev 仅支持 stdout/stderr，fd={fd}"
-                )));
-            }
+            let fd_i32 = fd as i32;
             let base = event.args[1];
             let count = usize::try_from(event.args[2])
                 .map_err(|_| DaotiError::Other("writev 数量溢出".into()))?;
-            let mut total = 0usize;
+            let mut aggregate = Vec::new();
             for i in 0..count {
                 let raw = memory.read(base + (i as u64) * 16, 16)?;
                 let address = u64::from_le_bytes(raw[0..8].try_into().unwrap());
                 let length = usize::try_from(u64::from_le_bytes(raw[8..16].try_into().unwrap()))
                     .map_err(|_| DaotiError::Other("writev 长度溢出".into()))?;
                 let data = memory.read(address, length as u64)?;
-                self.sink.write_all(data)?;
-                total += length;
+                aggregate.extend_from_slice(data);
             }
-            return Ok(total as i64);
+            if let Some((shared, is_write_end)) = self.pipes.get(&fd_i32) {
+                if !*is_write_end {
+                    return Ok(-9);
+                }
+                let mut buffer = shared
+                    .lock()
+                    .map_err(|_| DaotiError::Other("管道锁中毒".into()))?;
+                buffer.extend(aggregate.iter().copied());
+                return Ok(aggregate.len() as i64);
+            }
+            if let Some(counter) = self.eventfds.get_mut(&fd_i32) {
+                if aggregate.len() < 8 {
+                    return Ok(-22);
+                }
+                let value = u64::from_le_bytes(aggregate[0..8].try_into().unwrap());
+                *counter = counter.saturating_add(value);
+                return Ok(8);
+            }
+            if let Some(sock) = self.sockets.get_mut(&fd_i32) {
+                if sock.shutdown & 0x2 != 0 {
+                    return Ok(-32); // -EPIPE：写方向已关闭
+                }
+                let Some(tx) = &sock.tx else {
+                    return Ok(-107); // -ENOTCONN：socketpair 未连接
+                };
+                let mut buffer = tx
+                    .lock()
+                    .map_err(|_| DaotiError::Other("socket 缓冲锁中毒".into()))?;
+                buffer.extend(aggregate.iter().copied());
+                return Ok(aggregate.len() as i64);
+            }
+            if fd != 1 && fd != 2 {
+                return Err(DaotiError::Unavailable(format!(
+                    "writev 仅支持 stdout/stderr，fd={fd}"
+                )));
+            }
+            self.sink.write_all(&aggregate)?;
+            return Ok(aggregate.len() as i64);
+        }
+        if event.nr == SYS_READV {
+            // readv(fd, iov, iovcnt)：先按 fd 后端读取（pipe 读端 / eventfd /
+            // timerfd / files），再按各 iovec 段分散写入 guest 内存。错误语义与
+            // read 一致：空缓冲 -EAGAIN、写端 -EBADF、无效 fd -EBADF。
+            let fd = event.args[0] as i32;
+            let base = event.args[1];
+            let count = usize::try_from(event.args[2])
+                .map_err(|_| DaotiError::Other("readv 数量溢出".into()))?;
+            // 读取 iovec 段表，累计总请求长度。
+            let mut segments = Vec::with_capacity(count);
+            let mut requested = 0usize;
+            for i in 0..count {
+                let raw = memory.read(base + (i as u64) * 16, 16)?;
+                let address = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+                let length = usize::try_from(u64::from_le_bytes(raw[8..16].try_into().unwrap()))
+                    .map_err(|_| DaotiError::Other("readv 长度溢出".into()))?;
+                requested = requested.saturating_add(length);
+                segments.push((address, length));
+            }
+            // 从后端单次读取（语义与 read 相同）。
+            let data: Vec<u8> = if let Some((shared, is_write_end)) = self.pipes.get(&fd) {
+                if *is_write_end {
+                    return Ok(-9); // -EBADF：写端不可读
+                }
+                let mut buffer = shared
+                    .lock()
+                    .map_err(|_| DaotiError::Other("管道锁中毒".into()))?;
+                let take = requested.min(buffer.len());
+                if take == 0 {
+                    return Ok(-11); // -EAGAIN
+                }
+                buffer.drain(..take).collect()
+            } else if let Some(counter) = self.eventfds.get_mut(&fd) {
+                if requested < 8 {
+                    return Ok(-22); // -EINVAL
+                }
+                if *counter == 0 {
+                    return Ok(-11); // -EAGAIN
+                }
+                let value = *counter;
+                *counter = 0;
+                value.to_le_bytes().to_vec()
+            } else if let Some(deadline) = self.timerfds.get_mut(&fd) {
+                if requested < 8 {
+                    return Ok(-22); // -EINVAL
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| DaotiError::Other(format!("系统时间不可用：{e}")))?
+                    .as_nanos() as u64;
+                if deadline.is_none_or(|value| now < value) {
+                    return Ok(-11); // -EAGAIN：未到期
+                }
+                *deadline = None;
+                1u64.to_le_bytes().to_vec()
+            } else if let Some((bytes, offset)) = self.files.get_mut(&fd) {
+                let start = *offset;
+                let take = requested.min(bytes.len().saturating_sub(start));
+                *offset += take;
+                bytes[start..start + take].to_vec()
+            } else {
+                return Ok(-9); // -EBADF：未知 fd
+            };
+            // 分散写入各 iovec 段。
+            let mut cursor = 0usize;
+            for (address, length) in segments {
+                if cursor >= data.len() {
+                    break;
+                }
+                let end = cursor.saturating_add(length).min(data.len());
+                memory.write(address, &data[cursor..end])?;
+                cursor = end;
+            }
+            return Ok(data.len() as i64);
         }
         if event.nr != SYS_WRITE {
             return self.handle(event);
@@ -3348,6 +3459,51 @@ mod tests {
             bridge.handle_with_memory(&dup_bad, &mut memory).unwrap(),
             -9
         );
+    }
+
+    #[test]
+    fn readv_and_writev_scatter_gather_pipe() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // pipe2 创建管道
+        let create = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&create, &mut memory).unwrap();
+        let read_fd = u32::from_le_bytes(memory.read(0x1200, 4).unwrap().try_into().unwrap());
+        let write_fd = u32::from_le_bytes(memory.read(0x1204, 4).unwrap().try_into().unwrap());
+        // writev：两段 iovec 聚合写入管道（"AB" + "CD"）
+        memory.write(0x1300, b"AB").unwrap();
+        memory.write(0x1310, b"CD").unwrap();
+        let iov = 0x1400u64;
+        memory.write(iov, &(0x1300u64).to_le_bytes()).unwrap();
+        memory.write(iov + 8, &2u64.to_le_bytes()).unwrap();
+        memory.write(iov + 16, &(0x1310u64).to_le_bytes()).unwrap();
+        memory.write(iov + 24, &2u64.to_le_bytes()).unwrap();
+        let writev =
+            RuntimeSyscallEvent::enter(SYS_WRITEV, "writev", [write_fd as u64, iov, 2, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&writev, &mut memory).unwrap(), 4);
+        // readv：两段 iovec 分散读取（每段 2 字节）
+        let seg0 = 0x1500u64;
+        let seg1 = 0x1520u64;
+        memory.write(0x1500, b"__").unwrap();
+        memory.write(0x1520, b"__").unwrap();
+        let riov = 0x1410u64;
+        memory.write(riov, &seg0.to_le_bytes()).unwrap();
+        memory.write(riov + 8, &2u64.to_le_bytes()).unwrap();
+        memory.write(riov + 16, &seg1.to_le_bytes()).unwrap();
+        memory.write(riov + 24, &2u64.to_le_bytes()).unwrap();
+        let readv =
+            RuntimeSyscallEvent::enter(SYS_READV, "readv", [read_fd as u64, riov, 2, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&readv, &mut memory).unwrap(), 4);
+        assert_eq!(memory.read(0x1500, 2).unwrap(), b"AB");
+        assert_eq!(memory.read(0x1520, 2).unwrap(), b"CD");
+        // 空管道 readv → -EAGAIN
+        let empty =
+            RuntimeSyscallEvent::enter(SYS_READV, "readv", [read_fd as u64, riov, 1, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&empty, &mut memory).unwrap(), -11);
+        // 写端 readv → -EBADF
+        let bad =
+            RuntimeSyscallEvent::enter(SYS_READV, "readv", [write_fd as u64, riov, 1, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -9);
     }
 
     #[test]
