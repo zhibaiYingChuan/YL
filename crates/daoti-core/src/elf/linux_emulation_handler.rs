@@ -478,6 +478,9 @@ impl LinuxEmulationHandler {
     fn syscall_name(nr: u64) -> &'static str {
         match nr {
             1 => "write",
+            32 => "dup",
+            33 => "dup2",
+            292 => "dup3",
             293 => "pipe2",
             290 => "eventfd2",
             283 => "timerfd_create",
@@ -824,6 +827,9 @@ impl SyscallHandler for LinuxEmulationHandler {
         if matches!(
             event.nr,
             0 | 3
+                | 32
+                | 33
+                | 292
                 | 5
                 | 7
                 | 271

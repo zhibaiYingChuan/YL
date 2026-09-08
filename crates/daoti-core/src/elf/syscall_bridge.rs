@@ -14,6 +14,9 @@ use crate::bilateral::network::BilateralLadderNetwork;
 use crate::codec::{Decoder, Encoder, SyscallCodec};
 
 pub const SYS_WRITE: u64 = 1;
+pub const SYS_DUP: u64 = 32;
+pub const SYS_DUP2: u64 = 33;
+pub const SYS_DUP3: u64 = 292;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_FCNTL: u64 = 72;
 pub const SYS_ACCESS: u64 = 21;
@@ -590,6 +593,7 @@ type EpollRegistration = (i32, u32, u64);
 
 /// socket 状态：family/type/protocol、双向缓冲（socketpair 才连接）、方向关闭位与选项表。
 /// 与 pipe2 相同，socket fd 独立于文件 fd 编号空间维护。
+#[derive(Clone)]
 struct SocketState {
     family: u32,
     sock_type: u32,
@@ -1108,6 +1112,91 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 // F_GETLK=5：不应答锁，返回 -EINVAL
                 _ => return Ok(-22),
             }
+        }
+        if event.nr == SYS_DUP || event.nr == SYS_DUP2 || event.nr == SYS_DUP3 {
+            // dup(fd) / dup2(oldfd, newfd) / dup3(oldfd, newfd, flags)：
+            // 复制 fd 引用。pipes/sockets 经 Arc 共享同一缓冲区（真实语义）；
+            // files/eventfds/timerfds/dirs 复制快照值。dup2/dup3 先关闭目标 fd
+            // （若已存在），flow 与 Linux 一致。
+            let old_fd = event.args[0] as i32;
+            let requested_new = if event.nr == SYS_DUP {
+                None
+            } else {
+                Some(event.args[1] as i32)
+            };
+            if event.nr == SYS_DUP3 {
+                // flags 仅接受 0 或 O_CLOEXEC(0x80000)
+                if event.args[2] & !0x80000 != 0 {
+                    return Ok(-22); // -EINVAL
+                }
+            }
+            if let Some(new_fd) = requested_new {
+                // dup2 语义：old==new 时直接返回，不关闭。
+                if new_fd == old_fd {
+                    if event.nr == SYS_DUP3 && event.args[2] == 0 {
+                        return Ok(-22);
+                    }
+                    return Ok(new_fd as i64);
+                }
+            }
+            // 源 fd 必须存在（stdin/stdout/stderr 恒有效）。
+            let source_exists = old_fd < 3
+                || self.files.contains_key(&old_fd)
+                || self.dirs.contains_key(&old_fd)
+                || self.pipes.contains_key(&old_fd)
+                || self.eventfds.contains_key(&old_fd)
+                || self.timerfds.contains_key(&old_fd)
+                || self.sockets.contains_key(&old_fd);
+            if !source_exists {
+                return Ok(-9); // -EBADF
+            }
+            let clone_into = |new_fd: i32, bridge: &mut Self| {
+                if let Some(entry) = bridge.files.get(&old_fd) {
+                    bridge.files.insert(new_fd, entry.clone());
+                } else if let Some(entry) = bridge.dirs.get(&old_fd) {
+                    bridge.dirs.insert(new_fd, entry.clone());
+                } else if let Some(entry) = bridge.pipes.get(&old_fd) {
+                    bridge.pipes.insert(new_fd, entry.clone());
+                } else if let Some(entry) = bridge.eventfds.get(&old_fd) {
+                    bridge.eventfds.insert(new_fd, *entry);
+                } else if let Some(entry) = bridge.timerfds.get(&old_fd) {
+                    bridge.timerfds.insert(new_fd, *entry);
+                } else if let Some(entry) = bridge.sockets.get(&old_fd) {
+                    bridge.sockets.insert(new_fd, entry.clone());
+                }
+            };
+            let new_fd = match requested_new {
+                Some(new_fd) => {
+                    // 关闭目标 fd（若已存在），从所有后端移除。
+                    if self.files.contains_key(&new_fd) {
+                        self.files.remove(&new_fd);
+                    }
+                    if self.dirs.contains_key(&new_fd) {
+                        self.dirs.remove(&new_fd);
+                    }
+                    if self.pipes.contains_key(&new_fd) {
+                        self.pipes.remove(&new_fd);
+                    }
+                    if self.eventfds.contains_key(&new_fd) {
+                        self.eventfds.remove(&new_fd);
+                    }
+                    if self.timerfds.contains_key(&new_fd) {
+                        self.timerfds.remove(&new_fd);
+                    }
+                    if self.sockets.contains_key(&new_fd) {
+                        self.sockets.remove(&new_fd);
+                    }
+                    clone_into(new_fd, self);
+                    new_fd
+                }
+                None => {
+                    let new_fd = self.next_fd;
+                    self.next_fd += 1;
+                    clone_into(new_fd, self);
+                    new_fd
+                }
+            };
+            return Ok(new_fd as i64);
         }
         if event.nr == SYS_STATFS || event.nr == SYS_FSTATFS {
             // statfs(path, &buf) / fstatfs(fd, &buf)：填充 Linux x86_64
@@ -3206,6 +3295,59 @@ mod tests {
             -2
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dup_shares_pipe_buffer_and_dup2_replaces_target_fd() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        let create = RuntimeSyscallEvent::enter(SYS_PIPE2, "pipe2", [0x1200, 0, 0, 0, 0, 0]);
+        bridge.handle_with_memory(&create, &mut memory).unwrap();
+        let read_fd = u32::from_le_bytes(memory.read(0x1200, 4).unwrap().try_into().unwrap());
+        let write_fd = u32::from_le_bytes(memory.read(0x1204, 4).unwrap().try_into().unwrap());
+        // dup(read_fd) → 新 fd 与 read_fd 共享同一管道缓冲
+        let dup = RuntimeSyscallEvent::enter(SYS_DUP, "dup", [read_fd as u64, 0, 0, 0, 0, 0]);
+        let dup_fd = bridge.handle_with_memory(&dup, &mut memory).unwrap();
+        assert!(dup_fd > read_fd as i64);
+        // 写入管道，dup 后的读端应能读到数据
+        memory.write(0x1100, b"x").unwrap();
+        let write =
+            RuntimeSyscallEvent::enter(SYS_WRITE, "write", [write_fd as u64, 0x1100, 1, 0, 0, 0]);
+        bridge.handle_with_memory(&write, &mut memory).unwrap();
+        let read_dup =
+            RuntimeSyscallEvent::enter(SYS_READ, "read", [dup_fd as u64, 0x1300, 8, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&read_dup, &mut memory).unwrap(),
+            1
+        );
+        // dup2(read_fd, 9)：9 为新 fd，指向同一缓冲
+        let dup2 = RuntimeSyscallEvent::enter(SYS_DUP2, "dup2", [read_fd as u64, 9, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&dup2, &mut memory).unwrap(), 9);
+        // dup2 目标已存在：先关闭再复制（对管道 fd 生效）
+        let dup2_replace =
+            RuntimeSyscallEvent::enter(SYS_DUP2, "dup2", [read_fd as u64, 9, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge
+                .handle_with_memory(&dup2_replace, &mut memory)
+                .unwrap(),
+            9
+        );
+        // dup3 flags 非法 → -EINVAL
+        let dup3_bad = RuntimeSyscallEvent::enter(
+            SYS_DUP3,
+            "dup3",
+            [read_fd as u64, 10, 0x80000 | 0x1, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&dup3_bad, &mut memory).unwrap(),
+            -22
+        );
+        // 未知 fd → -EBADF
+        let dup_bad = RuntimeSyscallEvent::enter(SYS_DUP, "dup", [1234, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&dup_bad, &mut memory).unwrap(),
+            -9
+        );
     }
 
     #[test]
