@@ -519,6 +519,7 @@ impl LinuxEmulationHandler {
             80 => "chdir",
             74 => "fsync",
             77 => "ftruncate",
+            76 => "truncate",
             258 => "mkdirat",
             3 => "close",
             0 => "read",
@@ -873,6 +874,7 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 264
                 | 74
                 | 77
+                | 76
                 | 79
                 | 80
                 | 258

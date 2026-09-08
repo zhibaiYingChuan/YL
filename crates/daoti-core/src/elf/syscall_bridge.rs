@@ -26,6 +26,7 @@ pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_GETCWD: u64 = 79;
+pub const SYS_TRUNCATE: u64 = 76;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_FSYNC: u64 = 74;
 pub const SYS_FTRUNCATE: u64 = 77;
@@ -2673,6 +2674,34 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             }
             return Ok(0);
         }
+        if event.nr == SYS_TRUNCATE {
+            // truncate(pathname, length)：按路径在受控根内真实截断文件。
+            // 路径缺失返回 -ENOENT(-2)，无法解析的越界路径返回 -ENOENT；
+            // 长度非负由 usize 转换保证，截断语义与 ftruncate 一致。
+            let length = usize::try_from(event.args[1])
+                .map_err(|_| DaotiError::Other("truncate 长度超出平台范围".into()))?;
+            let mut raw = Vec::new();
+            for index in 0..4096u64 {
+                let byte = memory.read(event.args[0] + index, 1)?[0];
+                if byte == 0 {
+                    break;
+                }
+                raw.push(byte);
+            }
+            let path = Path::new(
+                std::str::from_utf8(&raw)
+                    .map_err(|_| DaotiError::Other("truncate 路径不是 UTF-8".into()))?,
+            );
+            let Some(candidate) = self.resolve_guest_path(path) else {
+                return Ok(-2); // -ENOENT：源不存在
+            };
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&candidate)
+                .map_err(DaotiError::Io)?;
+            file.set_len(length as u64).map_err(DaotiError::Io)?;
+            return Ok(0);
+        }
         if event.nr == SYS_MKDIRAT {
             // mkdirat(dirfd, pathname, mode)：仅 AT_FDCWD，创建受控根内目录（mode 不模拟）。
             let dirfd = event.args[0] as i64;
@@ -3504,6 +3533,33 @@ mod tests {
         let bad =
             RuntimeSyscallEvent::enter(SYS_READV, "readv", [write_fd as u64, riov, 1, 0, 0, 0]);
         assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -9);
+    }
+
+    #[test]
+    fn truncate_resizes_file_within_allowed_root() {
+        let root = std::env::temp_dir().join(format!("daoti-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("target"), b"0123456789").unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b"target\0").unwrap();
+        // 截断到 4 字节：应真实缩小文件
+        let trunc = RuntimeSyscallEvent::enter(SYS_TRUNCATE, "truncate", [0x1100, 4, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&trunc, &mut memory).unwrap(), 0);
+        assert_eq!(std::fs::read(root.join("target")).unwrap(), b"0123");
+        // 扩展到 6 字节：应补零
+        let extend = RuntimeSyscallEvent::enter(SYS_TRUNCATE, "truncate", [0x1100, 6, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&extend, &mut memory).unwrap(), 0);
+        assert_eq!(std::fs::read(root.join("target")).unwrap(), b"0123\0\0");
+        // 缺失路径：-ENOENT(-2)
+        memory.write(0x1200, b"nope\0").unwrap();
+        let missing = RuntimeSyscallEvent::enter(SYS_TRUNCATE, "truncate", [0x1200, 4, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&missing, &mut memory).unwrap(),
+            -2
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
