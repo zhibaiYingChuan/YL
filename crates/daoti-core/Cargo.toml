@@ -17,6 +17,8 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 # 模式B B2 双梯形网络纯数学变换（Array1<f64> → Array1<f64>）
 ndarray = { workspace = true }
+# 文件时间戳（elf 桥接 utimensat(280)：跨平台设置文件 atime/mtime）
+filetime = { workspace = true }
 
 # 系统信息采集（Windows 感知器可选）
 sysinfo = { workspace = true, optional = true }

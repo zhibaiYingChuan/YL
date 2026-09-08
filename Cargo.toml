@@ -57,6 +57,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # 文件选择对话框（玄镜「道体·通」面板选择二进制，取绝对路径，消除相对路径在 daemon cwd 下解析失败的歧义）
 rfd = "0.15"
 
+# 文件时间戳（elf 桥接 utimensat(280)：跨平台设置文件 atime/mtime）
+filetime = "0.2"
+
 # 版本
 daoti-common = { path = "crates/daoti-common", version = "0.1.0" }
 daoti-core = { path = "crates/daoti-core", version = "0.1.0" }

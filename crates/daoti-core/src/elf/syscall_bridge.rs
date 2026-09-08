@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use daoti_common::DaotiError;
+use filetime::FileTime;
 
 use super::runtime::{MemPerm, MemoryModel, MemoryRegion, RuntimeSyscallEvent, SyscallHandler};
 use crate::bilateral::network::BilateralLadderNetwork;
@@ -25,6 +26,7 @@ pub const SYS_FACCESSAT2: u64 = 439;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_UNLINKAT: u64 = 263;
+pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_TRUNCATE: u64 = 76;
@@ -1251,6 +1253,107 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             };
             std::fs::remove_file(&candidate).map_err(DaotiError::Io)?;
             return Ok(0);
+        }
+        if event.nr == SYS_UTIMENSAT {
+            // utimensat(dirfd, pathname, times, flags)：Linux x86_64 nr=280。
+            // 仅支持 dirfd=AT_FDCWD(-100)，其余返回 -EBADF(-9)；
+            // flags 仅接受 0 或 AT_SYMLINK_NOFOLLOW(0x100)，其余返回 -EINVAL(-22)。
+            // times 指向两个 16 字节 struct timespec：tv_sec(i64) 与 tv_nsec(i64)；
+            // times==NULL 表示 atime/mtime 均取当前时间；tv_nsec 必须属于
+            // [0, 1_000_000_000)，且 tv_sec/tv_nsec 必须处于 filetime::FileTime
+            // 可表达范围内（host SystemTime 构造成功后逐位回传），否则 -EINVAL，
+            // 绝不 panic；pathname/times 指向不可读 guest 内存返回 -EFAULT(-14)；
+            // 路径解析复用受控根（resolve_guest_path），目标缺失返回 -ENOENT(-2)。
+            // 真实设置由 filetime crate 完成：flags=0 用 set_file_times（跟随链接），
+            // AT_SYMLINK_NOFOLLOW 用 set_symlink_file_times（linux=utimensat
+            // AT_SYMLINK_NOFOLLOW，windows=FILE_FLAG_OPEN_REPARSE_POINT，均为真无跟随）。
+            const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+            let dirfd = event.args[0] as i64;
+            if dirfd != -100 {
+                return Ok(-9); // -EBADF：仅支持 AT_FDCWD
+            }
+            let flags = event.args[3];
+            let nofollow = flags == AT_SYMLINK_NOFOLLOW;
+            if flags != 0 && !nofollow {
+                return Ok(-22); // -EINVAL：仅允许 0 或 AT_SYMLINK_NOFOLLOW
+            }
+            // pathname 字符串；guest 内存不可读返回 -EFAULT。
+            let mut raw = Vec::new();
+            let mut unreadable = false;
+            for index in 0..4096u64 {
+                match memory.read(event.args[1] + index, 1) {
+                    Ok(byte) if byte[0] == 0 => break,
+                    Ok(byte) => raw.push(byte[0]),
+                    Err(_) => {
+                        unreadable = true;
+                        break;
+                    }
+                }
+            }
+            if unreadable {
+                return Ok(-14); // -EFAULT：pathname 不可读
+            }
+            let path = Path::new(
+                std::str::from_utf8(&raw)
+                    .map_err(|_| DaotiError::Other("utimensat 路径不是 UTF-8".into()))?,
+            );
+            let Some(candidate) = self.resolve_guest_path(path) else {
+                return Ok(-2); // -ENOENT：受控根内不存在
+            };
+            // 将 guest timespec 转换为 host SystemTime，进而转为 FileTime；
+            // 转换前显式校验可表达范围，越界返回 -EINVAL（不 panic）。
+            let parse_time = |tv_sec: i64, tv_nsec: i64| -> Result<SystemTime, ()> {
+                if !(0..1_000_000_000).contains(&tv_nsec) {
+                    return Err(()); // tv_nsec 越界
+                }
+                let seconds = u64::try_from(tv_sec).ok();
+                let base = if let Some(s) = seconds {
+                    UNIX_EPOCH.checked_add(std::time::Duration::from_secs(s))
+                } else {
+                    let magnitude = tv_sec.checked_neg().ok_or(())?;
+                    UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(magnitude as u64))
+                };
+                match base {
+                    Some(b) => Ok(b + std::time::Duration::from_nanos(tv_nsec as u64)),
+                    None => Err(()), // 超出 host SystemTime 可表达范围
+                }
+            };
+            // times==NULL：atime/mtime 使用当前时间（FileTime::now()）。
+            let pair = if event.args[2] == 0 {
+                (FileTime::now(), FileTime::now())
+            } else {
+                let times_data = match memory.read(event.args[2], 32) {
+                    Ok(bytes) => bytes.to_vec(),
+                    Err(_) => return Ok(-14), // -EFAULT：times 不可读
+                };
+                let secs: Vec<i64> = times_data
+                    .chunks_exact(16)
+                    .map(|entry| i64::from_le_bytes(entry[..8].try_into().unwrap()))
+                    .collect();
+                let nsecs: Vec<i64> = times_data
+                    .chunks_exact(16)
+                    .map(|entry| i64::from_le_bytes(entry[8..].try_into().unwrap()))
+                    .collect();
+                let atime = match parse_time(secs[0], nsecs[0]) {
+                    Ok(t) => FileTime::from(t),
+                    Err(()) => return Ok(-22), // -EINVAL：超出 FileTime 可表达范围
+                };
+                let mtime = match parse_time(secs[1], nsecs[1]) {
+                    Ok(t) => FileTime::from(t),
+                    Err(()) => return Ok(-22), // -EINVAL：超出 FileTime 可表达范围
+                };
+                (atime, mtime)
+            };
+            // 真实落盘；失败时优先透传 host errno，无法映射的统一按 -EINVAL 处理。
+            let result = if nofollow {
+                filetime::set_symlink_file_times(&candidate, pair.0, pair.1)
+            } else {
+                filetime::set_file_times(&candidate, pair.0, pair.1)
+            };
+            return match result {
+                Ok(()) => Ok(0),
+                Err(e) => Ok(-i64::from(e.raw_os_error().unwrap_or(22))), // 成功或 -errno/-EINVAL
+            };
         }
         if event.nr == SYS_RENAMEAT {
             // renameat(olddirfd, oldpath, newdirfd, newpath)：仅支持两个 AT_FDCWD(-100)，
@@ -3501,6 +3604,178 @@ mod tests {
             bridge.handle_with_memory(&missing, &mut memory).unwrap(),
             -2
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- utimensat(280) ----
+
+    /// 构造 utimensat 测试用的临时受控根与桥接器，测试结束清理目录。
+    fn utimensat_fixture(name: &str) -> (std::path::PathBuf, NativeSyscallBridge<BufferSink>) {
+        let root =
+            std::env::temp_dir().join(format!("daoti-utime-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("target"), b"x").unwrap();
+        let bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        (root, bridge)
+    }
+
+    /// 在 guest 内存 0x1300 处写入一对 struct timespec（各 16 字节：tv_sec i64 + tv_nsec i64）。
+    fn utimensat_write_times(memory: &mut MemoryModel, atime: (i64, i64), mtime: (i64, i64)) {
+        memory.write(0x1300, &atime.0.to_le_bytes()).unwrap();
+        memory.write(0x1308, &atime.1.to_le_bytes()).unwrap();
+        memory.write(0x1310, &mtime.0.to_le_bytes()).unwrap();
+        memory.write(0x1318, &mtime.1.to_le_bytes()).unwrap();
+    }
+
+    #[test]
+    fn utimensat_valid_times_returns_controlled_not_implemented() {
+        // 合法时间戳：所有参数校验通过。宿主无跨平台设置文件时间 API，
+        // 必须返回明确的受控错误 -ENOSYS(-38)，绝不伪造成功。
+        let (root, mut bridge) = utimensat_fixture("valid");
+        let mut memory = memory();
+        memory.write(0x1100, b"target\0").unwrap();
+        utimensat_write_times(
+            &mut memory,
+            (1_700_000_000, 0),
+            (1_700_000_100, 500_000_000),
+        );
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UTIMENSAT,
+            "utimensat",
+            [-100i64 as u64, 0x1100, 0x1300, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        let modified = std::fs::metadata(root.join("target"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let expected = UNIX_EPOCH + std::time::Duration::new(1_700_000_100, 500_000_000);
+        let delta = modified
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(delta <= std::time::Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utimensat_null_times_sets_current_time() {
+        let (root, mut bridge) = utimensat_fixture("null");
+        let mut memory = memory();
+        memory.write(0x1100, b"target\0").unwrap();
+        let before = SystemTime::now();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UTIMENSAT,
+            "utimensat",
+            [-100i64 as u64, 0x1100, 0, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        let modified = std::fs::metadata(root.join("target"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let delta = modified
+            .duration_since(before)
+            .unwrap_or_else(|e| e.duration());
+        assert!(delta <= std::time::Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utimensat_valid_flags_with_symlink_nofollow_also_succeeds() {
+        // filetime 提供真实的无跟随设置 API，合法标志应返回成功。
+        let (root, mut bridge) = utimensat_fixture("flags-ok");
+        let mut memory = memory();
+        memory.write(0x1100, b"target\0").unwrap();
+        utimensat_write_times(&mut memory, (0, 0), (0, 0));
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UTIMENSAT,
+            "utimensat",
+            [-100i64 as u64, 0x1100, 0x1300, 0x100, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utimensat_rejects_invalid_nanoseconds() {
+        // tv_nsec 必须属于 [0, 1_000_000_000)：越界（等于 1e9、负数）返回 -EINVAL(-22)。
+        let (root, mut bridge) = utimensat_fixture("nsec");
+        let mut memory = memory();
+        memory.write(0x1100, b"target\0").unwrap();
+        memory.write(0x1300, &0i64.to_le_bytes()).unwrap();
+        memory
+            .write(0x1308, &1_000_000_000i64.to_le_bytes())
+            .unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UTIMENSAT,
+            "utimensat",
+            [-100i64 as u64, 0x1100, 0x1300, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -22);
+        // 负纳秒（-1i64 以补码存储）同样非法
+        memory.write(0x1308, &(-1i64).to_le_bytes()).unwrap();
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -22);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utimensat_rejects_non_at_fdcwd_dirfd() {
+        // 仅支持 dirfd=AT_FDCWD(-100)，其余返回 -EBADF(-9)。
+        let (root, mut bridge) = utimensat_fixture("dirfd");
+        let mut memory = memory();
+        memory.write(0x1100, b"target\0").unwrap();
+        utimensat_write_times(&mut memory, (0, 0), (0, 0));
+        let event =
+            RuntimeSyscallEvent::enter(SYS_UTIMENSAT, "utimensat", [7u64, 0x1100, 0x1300, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utimensat_rejects_unknown_flags() {
+        // flags 含未知位（如 0x200）返回 -EINVAL(-22)。
+        let (root, mut bridge) = utimensat_fixture("flags");
+        let mut memory = memory();
+        memory.write(0x1100, b"target\0").unwrap();
+        utimensat_write_times(&mut memory, (0, 0), (0, 0));
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UTIMENSAT,
+            "utimensat",
+            [-100i64 as u64, 0x1100, 0x1300, 0x200, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -22);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utimensat_missing_path_returns_enoent() {
+        // 受控根内目标不存在：返回 -ENOENT(-2)。
+        let (root, mut bridge) = utimensat_fixture("missing");
+        let mut memory = memory();
+        memory.write(0x1100, b"no-such-file\0").unwrap();
+        utimensat_write_times(&mut memory, (0, 0), (0, 0));
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UTIMENSAT,
+            "utimensat",
+            [-100i64 as u64, 0x1100, 0x1300, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utimensat_unreadable_path_returns_efault() {
+        // pathname 指向未映射 guest 内存：返回 -EFAULT(-14)。
+        let (root, mut bridge) = utimensat_fixture("efault");
+        let mut memory = memory();
+        utimensat_write_times(&mut memory, (0, 0), (0, 0));
+        let event = RuntimeSyscallEvent::enter(
+            SYS_UTIMENSAT,
+            "utimensat",
+            [-100i64 as u64, 0x9000, 0x1300, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), -14);
         let _ = std::fs::remove_dir_all(&root);
     }
 
