@@ -21,6 +21,7 @@ pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_UNLINKAT: u64 = 263;
+pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_FSYNC: u64 = 74;
@@ -1149,6 +1150,52 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 return Ok(-2); // -ENOENT
             };
             std::fs::remove_file(&candidate).map_err(DaotiError::Io)?;
+            return Ok(0);
+        }
+        if event.nr == SYS_RENAMEAT {
+            // renameat(olddirfd, oldpath, newdirfd, newpath)：仅支持两个 AT_FDCWD(-100)，
+            // 在受控根内真实搬运；源缺失返回 -ENOENT(-2)，跨越受控根外的解析失败保持真实错误。
+            let old_dirfd = event.args[0] as i64;
+            let new_dirfd = event.args[2] as i64;
+            if old_dirfd != -100 || new_dirfd != -100 {
+                return Ok(-9); // -EBADF
+            }
+            let read_cstr = |ptr: u64| -> Result<Vec<u8>, DaotiError> {
+                let mut raw = Vec::new();
+                for index in 0..4096u64 {
+                    let byte = memory.read(ptr + index, 1)?[0];
+                    if byte == 0 {
+                        break;
+                    }
+                    raw.push(byte);
+                }
+                Ok(raw)
+            };
+            let old_bytes = read_cstr(event.args[1])?;
+            let new_bytes = read_cstr(event.args[3])?;
+            let old_guest = Path::new(
+                std::str::from_utf8(&old_bytes)
+                    .map_err(|_| DaotiError::Other("renameat 源路径不是 UTF-8".into()))?,
+            )
+            .to_path_buf();
+            let new_guest = Path::new(
+                std::str::from_utf8(&new_bytes)
+                    .map_err(|_| DaotiError::Other("renameat 目标路径不是 UTF-8".into()))?,
+            )
+            .to_path_buf();
+            // 源必须已存在于受控根内；目标可尚不存在，用沙盒候选构造（不校验存在性）。
+            let Some(old_path) = self.resolve_guest_path(&old_guest) else {
+                return Ok(-2); // -ENOENT：源不存在
+            };
+            let new_path = self
+                .resolve_sandbox_candidates(&new_guest)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            if new_path.as_os_str().is_empty() {
+                return Ok(-2); // -ENOENT：目标不可解析
+            }
+            std::fs::rename(&old_path, &new_path).map_err(DaotiError::Io)?;
             return Ok(0);
         }
         if matches!(event.nr, SYS_READ | SYS_PREAD64) {
@@ -3126,6 +3173,38 @@ mod tests {
         );
         assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
         assert!(root.join("newdir").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn renameat_moves_files_within_allowed_root() {
+        let root = std::env::temp_dir().join(format!("daoti-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("source"), b"payload").unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b"source\0").unwrap();
+        memory.write(0x1200, b"renamed\0").unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_RENAMEAT,
+            "renameat",
+            [-100i64 as u64, 0x1100, -100i64 as u64, 0x1200, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        assert!(!root.join("source").exists());
+        assert_eq!(std::fs::read(root.join("renamed")).unwrap(), b"payload");
+        // 源缺失：renameat 应返回 -ENOENT(-2)
+        let missing = RuntimeSyscallEvent::enter(
+            SYS_RENAMEAT,
+            "renameat",
+            [-100i64 as u64, 0x1100, -100i64 as u64, 0x1240, 0, 0],
+        );
+        memory.write(0x1240, b"other\0").unwrap();
+        assert_eq!(
+            bridge.handle_with_memory(&missing, &mut memory).unwrap(),
+            -2
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
