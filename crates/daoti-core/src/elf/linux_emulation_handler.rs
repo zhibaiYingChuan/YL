@@ -520,6 +520,7 @@ impl LinuxEmulationHandler {
             74 => "fsync",
             77 => "ftruncate",
             76 => "truncate",
+            332 => "statx",
             258 => "mkdirat",
             3 => "close",
             0 => "read",
@@ -875,6 +876,7 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 74
                 | 77
                 | 76
+                | 332
                 | 79
                 | 80
                 | 258

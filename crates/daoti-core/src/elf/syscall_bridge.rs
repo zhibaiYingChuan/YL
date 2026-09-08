@@ -27,6 +27,7 @@ pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_TRUNCATE: u64 = 76;
+pub const SYS_STATX: u64 = 332;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_FSYNC: u64 = 74;
 pub const SYS_FTRUNCATE: u64 = 77;
@@ -1360,6 +1361,48 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 *offset = end;
             }
             return Ok(read as i64);
+        }
+        if event.nr == SYS_STATX {
+            // statx(dirfd, pathname, flags, mask, statxbuf)：仅支持 AT_FDCWD，
+            // 在受控根内读取真实元数据；未知扩展字段保持零，mask 只声明已填充字段。
+            if event.args[0] as i64 != -100 {
+                return Ok(-9); // -EBADF
+            }
+            let mut raw = Vec::new();
+            for index in 0..4096u64 {
+                let byte = memory.read(event.args[1] + index, 1)?[0];
+                if byte == 0 {
+                    break;
+                }
+                raw.push(byte);
+            }
+            let path = Path::new(
+                std::str::from_utf8(&raw)
+                    .map_err(|_| DaotiError::Other("statx 路径不是 UTF-8".into()))?,
+            );
+            let Some(candidate) = self.resolve_guest_path(path) else {
+                return Ok(-2); // -ENOENT
+            };
+            let metadata = std::fs::metadata(&candidate).map_err(DaotiError::Io)?;
+            let mut statx = [0u8; 256];
+            // struct statx：mask 0、blksize 4、attributes 8、nlink 16、uid 20、gid 24、
+            // mode 28；ino 32、size 40、blocks 48；atime 64、mtime 80、ctime 96。
+            statx[0..4].copy_from_slice(&0x07ffu32.to_le_bytes());
+            statx[4..8].copy_from_slice(&4096u32.to_le_bytes());
+            statx[16..20].copy_from_slice(&1u32.to_le_bytes());
+            statx[20..24].copy_from_slice(&1000u32.to_le_bytes());
+            statx[24..28].copy_from_slice(&1000u32.to_le_bytes());
+            let mode = if metadata.is_dir() {
+                0o040000u16 | 0o755
+            } else {
+                0o100000u16 | 0o644
+            };
+            statx[28..30].copy_from_slice(&mode.to_le_bytes());
+            statx[32..40].copy_from_slice(&1u64.to_le_bytes());
+            statx[40..48].copy_from_slice(&metadata.len().to_le_bytes());
+            statx[48..56].copy_from_slice(&metadata.len().div_ceil(512).to_le_bytes());
+            memory.write(event.args[4], &statx)?;
+            return Ok(0);
         }
         if event.nr == SYS_FSTAT || event.nr == SYS_NEWFSTATAT {
             let stat_addr = if event.nr == SYS_FSTAT {
@@ -3559,6 +3602,45 @@ mod tests {
             bridge.handle_with_memory(&missing, &mut memory).unwrap(),
             -2
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn statx_reads_real_metadata_within_allowed_root() {
+        let root = std::env::temp_dir().join(format!("daoti-statx-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("data"), b"0123456789").unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b"data\0").unwrap();
+        let event = RuntimeSyscallEvent::enter(
+            SYS_STATX,
+            "statx",
+            [-100i64 as u64, 0x1100, 0, 0, 0x1200, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        // size@40 = 10；mode@28 低位 = S_IFREG(0o100000)|0o644
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1228, 8).unwrap().try_into().unwrap()),
+            10
+        );
+        let mode = u16::from_le_bytes(memory.read(0x121c, 2).unwrap().try_into().unwrap());
+        assert_eq!(mode, 0o100000u16 | 0o644);
+        // 缺失路径：-ENOENT(-2)
+        memory.write(0x1100, b"missing\0").unwrap();
+        let missing = RuntimeSyscallEvent::enter(
+            SYS_STATX,
+            "statx",
+            [-100i64 as u64, 0x1100, 0, 0, 0x1200, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&missing, &mut memory).unwrap(),
+            -2
+        );
+        // 非法 dirfd：-EBADF(-9)
+        let bad = RuntimeSyscallEvent::enter(SYS_STATX, "statx", [7u64, 0x1100, 0, 0, 0x1200, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -9);
         let _ = std::fs::remove_dir_all(&root);
     }
 
