@@ -96,6 +96,7 @@ pub const SYS_TKILL: u64 = 200;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
+pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_FUTEX: u64 = 202;
 pub const SYS_SCHED_SETAFFINITY: u64 = 203;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
@@ -3011,6 +3012,22 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             memory.write(address, &value)?;
             return Ok(0);
         }
+        if event.nr == SYS_NANOSLEEP {
+            // nanosleep(req, rem)：读取 Linux timespec，执行真实宿主休眠。
+            // tv_nsec 必须位于 [0, 1_000_000_000)，否则返回 -EINVAL；本仿真
+            // 不被信号打断，因此 rem 非空时写入零。
+            let seconds = i64::from_le_bytes(memory.read(event.args[0], 8)?.try_into().unwrap());
+            let nanoseconds =
+                i64::from_le_bytes(memory.read(event.args[0] + 8, 8)?.try_into().unwrap());
+            if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+                return Ok(-22); // -EINVAL
+            }
+            std::thread::sleep(std::time::Duration::new(seconds as u64, nanoseconds as u32));
+            if event.args[1] != 0 {
+                memory.write(event.args[1], &[0u8; 16])?;
+            }
+            return Ok(0);
+        }
         if event.nr == SYS_WRITEV {
             // writev(fd, iov, iovcnt)：聚合全部 iovec 段后，按与 write 相同的
             // 后端分派（pipe 写端扩展、eventfd 累加、socket 发送缓冲、stdout/stderr）。
@@ -3710,6 +3727,38 @@ mod tests {
             -9
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nanosleep_sleeps_and_writes_zero_remaining() {
+        let mut bridge = NativeSyscallBridge::new(BufferSink::default());
+        let mut memory = memory();
+        // req: 0 秒 + 1ms；rem 指向 0x1400
+        memory.write(0x1300, &0i64.to_le_bytes()).unwrap();
+        memory.write(0x1308, &1_000_000i64.to_le_bytes()).unwrap();
+        let event =
+            RuntimeSyscallEvent::enter(SYS_NANOSLEEP, "nanosleep", [0x1300, 0x1400, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&event, &mut memory).unwrap(), 0);
+        // rem 被清零
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1400, 8).unwrap().try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory.read(0x1408, 8).unwrap().try_into().unwrap()),
+            0
+        );
+        // nsec 越界 → -EINVAL
+        memory
+            .write(0x1308, &1_000_000_000i64.to_le_bytes())
+            .unwrap();
+        let bad = RuntimeSyscallEvent::enter(SYS_NANOSLEEP, "nanosleep", [0x1300, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -22);
+        // 负秒 → -EINVAL
+        memory.write(0x1300, &(-1i64).to_le_bytes()).unwrap();
+        memory.write(0x1308, &0i64.to_le_bytes()).unwrap();
+        let neg = RuntimeSyscallEvent::enter(SYS_NANOSLEEP, "nanosleep", [0x1300, 0, 0, 0, 0, 0]);
+        assert_eq!(bridge.handle_with_memory(&neg, &mut memory).unwrap(), -22);
     }
 
     #[test]

@@ -571,6 +571,7 @@ impl LinuxEmulationHandler {
             203 => "sched_setaffinity",
             204 => "sched_getaffinity",
             228 => "clock_gettime",
+            35 => "nanosleep",
             234 => "tgkill",
             _ => "unknown",
         }
@@ -920,6 +921,7 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 204
                 | 218
                 | 228
+                | 35
                 | 234
                 | 257
                 | 262
