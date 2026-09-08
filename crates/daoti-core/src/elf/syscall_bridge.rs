@@ -21,6 +21,7 @@ pub const SYS_LSEEK: u64 = 8;
 pub const SYS_FCNTL: u64 = 72;
 pub const SYS_ACCESS: u64 = 21;
 pub const SYS_FACCESSAT: u64 = 269;
+pub const SYS_FACCESSAT2: u64 = 439;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_UNLINKAT: u64 = 263;
@@ -958,22 +959,26 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
                 event.name, event.nr, event.args, self.current_brk, self.heap_end
             );
         }
-        if event.nr == SYS_ACCESS || event.nr == SYS_FACCESSAT {
-            if event.nr == SYS_FACCESSAT {
-                // faccessat(dirfd, pathname, mode, flags)：仅支持 AT_FDCWD(-100)
-                // 与其他 at 系列一致；flags 仅接受 0，未知 dirfd 返回 -EBADF。
+        if event.nr == SYS_ACCESS || event.nr == SYS_FACCESSAT || event.nr == SYS_FACCESSAT2 {
+            if event.nr == SYS_FACCESSAT || event.nr == SYS_FACCESSAT2 {
+                // faccessat(dirfd, pathname, mode, flags) / faccessat2(dirfd, pathname, flags, mode)：
+                // 仅支持 AT_FDCWD(-100) 与其他 at 系列一致；faccessat flags 仅接受 0，
+                // faccessat2 flags 允许低位含 AT_EACCESS(0x200) 之外不接受其他位，未知 dirfd 返回 -EBADF。
                 let dirfd = event.args[0] as i64;
                 if dirfd != -100 {
                     return Ok(-9); // -EBADF
                 }
-                if event.args[3] != 0 {
+                if event.nr == SYS_FACCESSAT && event.args[3] != 0 {
                     return Ok(-22); // -EINVAL（不支持 AT_EACCESS 等标志）
                 }
+                if event.nr == SYS_FACCESSAT2 && event.args[2] & !0x200 != 0 {
+                    return Ok(-22); // -EINVAL：仅允许 AT_EACCESS 位
+                }
             }
-            let path_ptr = if event.nr == SYS_FACCESSAT {
-                event.args[1]
-            } else {
+            let path_ptr = if event.nr == SYS_ACCESS {
                 event.args[0]
+            } else {
+                event.args[1]
             };
             let mut raw = Vec::new();
             for index in 0..4096u64 {
@@ -990,10 +995,12 @@ impl<S: OutputSink> NativeSyscallBridge<S> {
             let Some(candidate) = self.resolve_guest_path(path) else {
                 return Ok(-2);
             };
-            let mode = if event.nr == SYS_FACCESSAT {
+            let mode = if event.nr == SYS_ACCESS {
+                event.args[1]
+            } else if event.nr == SYS_FACCESSAT {
                 event.args[2]
             } else {
-                event.args[1]
+                event.args[3] // faccessat2：mode 是第 4 个参数
             };
             if mode & 4 != 0 && std::fs::metadata(&candidate).is_err() {
                 return Ok(-13);
@@ -3641,6 +3648,67 @@ mod tests {
         // 非法 dirfd：-EBADF(-9)
         let bad = RuntimeSyscallEvent::enter(SYS_STATX, "statx", [7u64, 0x1100, 0, 0, 0x1200, 0]);
         assert_eq!(bridge.handle_with_memory(&bad, &mut memory).unwrap(), -9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn faccessat2_checks_access_with_eaccess_flag() {
+        let root = std::env::temp_dir().join(format!("daoti-fac2-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("data"), b"payload").unwrap();
+        let mut bridge =
+            NativeSyscallBridge::new(BufferSink::default()).with_allowed_roots(&[root.clone()]);
+        let mut memory = memory();
+        memory.write(0x1100, b"data\0").unwrap();
+        // 可读检查：F_OK(0) → 0
+        let ok = RuntimeSyscallEvent::enter(
+            SYS_FACCESSAT2,
+            "faccessat2",
+            [-100i64 as u64, 0x1100, 0, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&ok, &mut memory).unwrap(), 0);
+        // 写检查 R_OK|W_OK(4|2=6) → 宿主为只读快照，返回 -EACCES(-13)
+        let write = RuntimeSyscallEvent::enter(
+            SYS_FACCESSAT2,
+            "faccessat2",
+            [-100i64 as u64, 0x1100, 0, 6, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&write, &mut memory).unwrap(), -13);
+        // AT_EACCESS(0x200) 仅影响权限检查身份，仿真接受 → 0
+        let eaccess = RuntimeSyscallEvent::enter(
+            SYS_FACCESSAT2,
+            "faccessat2",
+            [-100i64 as u64, 0x1100, 0x200, 0, 0, 0],
+        );
+        assert_eq!(bridge.handle_with_memory(&eaccess, &mut memory).unwrap(), 0);
+        // 非法 flags 位（0x1）→ -EINVAL(-22)
+        let bad_flags = RuntimeSyscallEvent::enter(
+            SYS_FACCESSAT2,
+            "faccessat2",
+            [-100i64 as u64, 0x1100, 0x1, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&bad_flags, &mut memory).unwrap(),
+            -22
+        );
+        // 缺失路径 → -ENOENT(-2)
+        memory.write(0x1200, b"missing\0").unwrap();
+        let missing = RuntimeSyscallEvent::enter(
+            SYS_FACCESSAT2,
+            "faccessat2",
+            [-100i64 as u64, 0x1200, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            bridge.handle_with_memory(&missing, &mut memory).unwrap(),
+            -2
+        );
+        // 非法 dirfd → -EBADF(-9)
+        let bad_dirfd =
+            RuntimeSyscallEvent::enter(SYS_FACCESSAT2, "faccessat2", [7u64, 0x1100, 0, 0, 0, 0]);
+        assert_eq!(
+            bridge.handle_with_memory(&bad_dirfd, &mut memory).unwrap(),
+            -9
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

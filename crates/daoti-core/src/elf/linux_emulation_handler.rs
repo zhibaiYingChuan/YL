@@ -507,6 +507,7 @@ impl LinuxEmulationHandler {
             8 => "lseek",
             21 => "access",
             269 => "faccessat",
+            439 => "faccessat2",
             63 => "uname",
             257 => "openat",
             262 => "newfstatat",
@@ -892,6 +893,7 @@ impl SyscallHandler for LinuxEmulationHandler {
                 | 17
                 | 21
                 | 269
+                | 439
                 | 28
                 | 39
                 | 110
